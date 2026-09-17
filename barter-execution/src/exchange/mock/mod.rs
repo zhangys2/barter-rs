@@ -813,8 +813,18 @@ mod tests {
     fn open_order_updates_both_assets_for_buy_and_sell() {
         let mut exchange = exchange();
         exchange.fees_percent = Decimal::new(1, 2);
-        let (buy, _) = exchange.open_order(request(Side::Buy, 2, 10));
+        let (buy, notifications) = exchange.open_order(request(Side::Buy, 2, 10));
         assert!(buy.state.is_ok());
+        let notifications = notifications.expect("accepted fill emits notifications");
+        assert_eq!(notifications.balances.len(), 2);
+        assert!(notifications.balances.iter().any(|balance| {
+            balance.0.asset == AssetNameExchange::from("USDT")
+                && balance.0.balance.free == Decimal::new(99798, 1)
+        }));
+        assert!(notifications.balances.iter().any(|balance| {
+            balance.0.asset == AssetNameExchange::from("BTC")
+                && balance.0.balance.free == Decimal::new(102, 0)
+        }));
         assert_eq!(
             exchange
                 .account
