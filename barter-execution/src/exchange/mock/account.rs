@@ -12,7 +12,7 @@ use crate::{
 use barter_instrument::{
     asset::{QuoteAsset, name::AssetNameExchange},
     exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    instrument::{Instrument, name::InstrumentNameExchange},
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
@@ -234,11 +234,46 @@ impl AccountState {
                 state: cancelled.clone(),
             },
         );
+        self.release_reservation(cid, time_exchange);
         Ok(cancelled)
     }
 
     pub fn insert_open_order(&mut self, order: Order<ExchangeId, InstrumentNameExchange, Open>) {
         self.orders_open.insert(order.key.cid.clone(), order);
+    }
+
+    pub fn restore_reservations(
+        &mut self,
+        instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+        fees_percent: rust_decimal::Decimal,
+        time_exchange: DateTime<Utc>,
+    ) {
+        let orders: Vec<_> = self.orders_open.values().cloned().collect();
+        for order in orders {
+            let remaining = order.quantity.abs() - order.state.filled_quantity.abs();
+            if remaining <= rust_decimal::Decimal::ZERO {
+                continue;
+            }
+            let Some(instrument) = instruments.get(&order.key.instrument) else {
+                continue;
+            };
+            let (asset, amount) = match order.side {
+                barter_instrument::Side::Buy => (
+                    instrument.underlying.quote.clone(),
+                    remaining * order.price * (rust_decimal::Decimal::ONE + fees_percent),
+                ),
+                barter_instrument::Side::Sell => (instrument.underlying.base.clone(), remaining),
+            };
+            let already_reserved = self
+                .balance(&asset)
+                .is_some_and(|balance| balance.balance.free < balance.balance.total);
+            if already_reserved {
+                self.reservations
+                    .insert(order.key.cid.clone(), (asset, amount));
+            } else {
+                let _ = self.reserve_balance(&order.key.cid, &asset, amount, time_exchange);
+            }
+        }
     }
 
     pub fn open_order_mut(

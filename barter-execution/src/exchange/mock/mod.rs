@@ -84,16 +84,20 @@ impl MockExchange {
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
         latency_model: Arc<dyn LatencyModel>,
     ) -> Self {
+        let fees_percent = config.fees_percent;
+        let mut account = AccountState::from(config.initial_state);
+        account.restore_reservations(&instruments, fees_percent, DateTime::<Utc>::UNIX_EPOCH);
+
         Self {
             exchange: config.mocked_exchange,
             latency_ms: config.latency_ms,
             latency_model,
-            fees_percent: config.fees_percent,
+            fees_percent,
             request_rx,
             market_rx,
             event_tx,
             instruments,
-            account: AccountState::from(config.initial_state),
+            account,
             order_sequence: 0,
             time_exchange_latest: Default::default(),
             market_books: FnvHashMap::default(),
@@ -456,6 +460,20 @@ impl MockExchange {
         Order<ExchangeId, InstrumentNameExchange, Result<Open, UnindexedOrderError>>,
         Option<OpenOrderNotifications>,
     ) {
+        if self
+            .account
+            .orders_open()
+            .any(|order| order.key.cid == request.key.cid)
+        {
+            return (
+                build_open_order_err_response(
+                    request,
+                    ApiError::OrderRejected("client order id is already active".into()),
+                ),
+                None,
+            );
+        }
+
         if let Err(error) = self.validate_order_kind_supported(request.state.kind) {
             return (build_open_order_err_response(request, error), None);
         }
@@ -900,6 +918,126 @@ mod tests {
         );
         assert_eq!(response.price, Decimal::from(7));
         assert!(notifications.is_some());
+    }
+
+    #[test]
+    fn duplicate_active_client_order_id_is_rejected_without_leaking_reservation() {
+        let mut exchange = exchange();
+        let mut resting = request(Side::Buy, 1, 8);
+        resting.state.kind = OrderKind::Limit;
+        resting.state.time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
+        let duplicate = resting.clone();
+
+        let (accepted, _) = exchange.open_order(resting);
+        assert!(accepted.state.is_ok());
+        let balance_before = exchange
+            .account
+            .balance(&AssetNameExchange::from("USDT"))
+            .unwrap()
+            .balance;
+
+        let (rejected, notifications) = exchange.open_order(duplicate);
+        assert!(matches!(
+            rejected.state,
+            Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(_)))
+        ));
+        assert!(notifications.is_none());
+        assert_eq!(exchange.account.orders_open().count(), 1);
+        assert_eq!(
+            exchange
+                .account
+                .balance(&AssetNameExchange::from("USDT"))
+                .unwrap()
+                .balance,
+            balance_before
+        );
+        assert_eq!(
+            exchange.account.reservation(&accepted.key.cid),
+            Some(&(AssetNameExchange::from("USDT"), Decimal::from(8)))
+        );
+    }
+
+    #[test]
+    fn restored_active_order_cancel_releases_reservation() {
+        let mut source = exchange();
+        let mut resting = request(Side::Buy, 1, 8);
+        resting.state.kind = OrderKind::Limit;
+        resting.state.time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
+        let (accepted, _) = source.open_order(resting);
+        let cid = accepted.key.cid.clone();
+        let snapshot = source.account_snapshot();
+
+        let mut restored = AccountState::from(snapshot);
+        restored.restore_reservations(
+            &source.instruments,
+            source.fees_percent,
+            DateTime::<Utc>::UNIX_EPOCH,
+        );
+        assert_eq!(
+            restored.reservation(&cid),
+            Some(&(AssetNameExchange::from("USDT"), Decimal::from(8)))
+        );
+        let balance_before_cancel = restored
+            .balance(&AssetNameExchange::from("USDT"))
+            .unwrap()
+            .balance;
+        let cancelled = restored
+            .cancel_order(&cid, None, DateTime::<Utc>::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(cancelled.id, accepted.state.unwrap().id);
+        assert_eq!(restored.reservation(&cid), None);
+        assert_eq!(
+            restored
+                .balance(&AssetNameExchange::from("USDT"))
+                .unwrap()
+                .balance
+                .free,
+            balance_before_cancel.free + Decimal::from(8)
+        );
+    }
+
+    #[test]
+    fn sell_side_resting_order_reserves_base_and_cancel_restores_it() {
+        let mut exchange = exchange();
+        let mut resting = request(Side::Sell, 3, 11);
+        resting.state.kind = OrderKind::Limit;
+        resting.state.time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
+        let key = resting.key.clone();
+        let (accepted, notifications) = exchange.open_order(resting);
+        assert!(accepted.state.is_ok());
+        assert!(notifications.is_none());
+        assert_eq!(
+            exchange.account.reservation(&key.cid),
+            Some(&(AssetNameExchange::from("BTC"), Decimal::from(3)))
+        );
+        assert_eq!(
+            exchange
+                .account
+                .balance(&AssetNameExchange::from("BTC"))
+                .unwrap()
+                .balance,
+            Balance {
+                total: Decimal::from(100),
+                free: Decimal::from(97),
+            }
+        );
+
+        let cancelled = exchange.cancel_order(OrderEvent {
+            key,
+            state: RequestCancel { id: None },
+        });
+        assert!(cancelled.state.is_ok());
+        assert_eq!(
+            exchange
+                .account
+                .balance(&AssetNameExchange::from("BTC"))
+                .unwrap()
+                .balance,
+            Balance {
+                total: Decimal::from(100),
+                free: Decimal::from(100),
+            }
+        );
     }
 
     #[tokio::test]
