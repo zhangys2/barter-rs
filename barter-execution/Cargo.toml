@@ -12,10 +12,21 @@ keywords = ["trading", "backtesting", "crypto", "stocks", "investment"]
 categories = ["accessibility", "simulation"]
 
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [dependencies]
 # Barter Ecosystem
-barter-integration = { workspace = true, features = ["collection", "error", "stream"] }
+barter-integration = { workspace = true, features = ["channel", "collection", "error", "stream"] }
 barter-instrument = { workspace = true }
+
+# HTTP and signing
+reqwest = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -24,6 +35,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros", "rt-multi-thread"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
 
 # Data Structures
 smol_str = { workspace = true }

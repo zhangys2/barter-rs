@@ -559,7 +559,59 @@ mod tests {
     use super::*;
     use crate::test_utils::{time_plus_days, trade};
     use barter_instrument::instrument::name::InstrumentNameInternal;
+    use proptest::prelude::*;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+
+    proptest! {
+        #[test]
+        fn increasing_position_has_weighted_entry_price(
+            first_quantity in 1u32..100,
+            second_quantity in 1u32..100,
+            first_price in 1u32..10_000,
+            second_price in 1u32..10_000,
+        ) {
+            let time = DateTime::<Utc>::MIN_UTC;
+            let first_quantity = first_quantity as f64;
+            let second_quantity = second_quantity as f64;
+            let first_price = first_price as f64;
+            let second_price = second_price as f64;
+            let initial = Position::from(&trade(time, Side::Buy, first_price, first_quantity, 0.0));
+            let (updated, exited) = initial.update_from_trade(&trade(
+                time_plus_days(time, 1), Side::Buy, second_price, second_quantity, 0.0,
+            ));
+            let updated = updated.unwrap();
+            prop_assert!(exited.is_none());
+            prop_assert_eq!(updated.quantity_abs, Decimal::from_f64_retain(first_quantity + second_quantity).unwrap());
+            let expected = (first_price * first_quantity + second_price * second_quantity)
+                / (first_quantity + second_quantity);
+            prop_assert_eq!(updated.price_entry_average, Decimal::from_f64_retain(expected).unwrap());
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn reduce_close_and_flip_emit_exit_invariants(
+            open_quantity in 2u32..100,
+            close_quantity in 1u32..100,
+        ) {
+            let time = DateTime::<Utc>::MIN_UTC;
+            let open_quantity = open_quantity as f64;
+            let close_quantity = close_quantity as f64;
+            let initial = Position::from(&trade(time, Side::Buy, 100.0, open_quantity, 0.0));
+            let (updated, exited) = initial.update_from_trade(&trade(
+                time_plus_days(time, 1), Side::Sell, 100.0, close_quantity, 0.0,
+            ));
+            prop_assert!(exited.is_some());
+            if close_quantity < open_quantity {
+                prop_assert_eq!(updated.unwrap().quantity_abs, Decimal::from_f64_retain(open_quantity - close_quantity).unwrap());
+            } else if close_quantity == open_quantity {
+                prop_assert!(updated.is_none());
+            } else {
+                prop_assert_eq!(updated.unwrap().quantity_abs, Decimal::from_f64_retain(close_quantity - open_quantity).unwrap());
+            }
+        }
+    }
 
     #[test]
     fn test_position_update_from_trade() {

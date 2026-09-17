@@ -26,14 +26,65 @@ use barter_instrument::{
 };
 use barter_integration::{
     FeedEnded, Terminal,
-    channel::{Channel, ChannelTxDroppable, mpsc_unbounded},
+    channel::{
+        Channel, ChannelTxDroppable, LatencySamples, OverflowPolicy, mpsc_bounded, mpsc_unbounded,
+    },
     collection::snapshot::SnapUpdates,
 };
 use derive_more::Constructor;
 use fnv::FnvHashMap;
-use futures::Stream;
+use futures::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, marker::PhantomData};
+use std::{
+    fmt::Debug,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+#[derive(Debug, Clone)]
+struct TimedMarket<Event> {
+    event: Event,
+    started: Instant,
+}
+
+async fn merge_event_feeds<Event, AccountStream>(
+    mut market_rx: barter_integration::channel::BoundedRx<TimedMarket<Event>>,
+    mut account_stream: AccountStream,
+    mut feed_tx: barter_integration::channel::BoundedTx<Event>,
+    market_latency: Arc<Mutex<LatencySamples>>,
+) where
+    AccountStream: Stream + Unpin,
+    Event: From<AccountStream::Item> + Send,
+{
+    let mut account_done = false;
+    let mut market_done = false;
+    loop {
+        if account_done && market_done {
+            break;
+        }
+        tokio::select! {
+            biased;
+            account = account_stream.next(), if !account_done => {
+                match account {
+                    Some(account) => {
+                        if SinkExt::send(&mut feed_tx, Event::from(account)).await.is_err() { break; }
+                    }
+                    None => account_done = true,
+                }
+            }
+            market = StreamExt::next(&mut market_rx), if !market_done => {
+                match market {
+                    Some(timed) => {
+                        if let Ok(mut samples) = market_latency.lock() { samples.record(timed.started); }
+                        if SinkExt::send(&mut feed_tx, timed.event).await.is_err() { break; }
+                    }
+                    None => market_done = true,
+                }
+            }
+        }
+    }
+}
 
 /// Defines how the `Engine` processes input events.
 ///
@@ -104,6 +155,8 @@ pub struct SystemBuilder<'a, Clock, Strategy, Risk, MarketStream, GlobalData, Fn
     audit_mode: Option<AuditMode>,
     trading_state: Option<TradingState>,
     balances: FnvHashMap<ExchangeAsset<AssetNameInternal>, Balance>,
+    market_channel_capacity: usize,
+    market_overflow_policy: OverflowPolicy,
 }
 
 impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
@@ -121,6 +174,8 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             audit_mode: None,
             trading_state: None,
             balances: FnvHashMap::default(),
+            market_channel_capacity: 4096,
+            market_overflow_policy: OverflowPolicy::DropOldest,
         }
     }
 
@@ -174,6 +229,16 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
         self
     }
 
+    /// Configure the bounded market-feed capacity and overflow behavior.
+    pub fn market_channel(self, capacity: usize, policy: OverflowPolicy) -> Self {
+        assert!(capacity > 0, "market channel capacity must be positive");
+        Self {
+            market_channel_capacity: capacity,
+            market_overflow_policy: policy,
+            ..self
+        }
+    }
+
     /// Build the [`SystemBuild`] with the configured builder settings.
     ///
     /// This constructs all the system components but does not start any tasks or streams.
@@ -217,6 +282,8 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             audit_mode,
             trading_state,
             balances,
+            market_channel_capacity,
+            market_overflow_policy,
         } = self;
 
         // Default if not provided
@@ -233,6 +300,11 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
                     ExecutionConfig::Mock(mock_config) => {
                         builder.add_mock(mock_config, clock.clone())
                     }
+                    ExecutionConfig::BinanceSpot(config) => builder
+                        .add_live::<barter_execution::client::BinanceSpot>(
+                        config,
+                        std::time::Duration::from_secs(5),
+                    ),
                 },
             )?
             .build();
@@ -258,6 +330,9 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             market_stream,
             account_channel: execution.account_channel,
             execution_build_futures: execution.futures,
+            market_channel_capacity,
+            market_overflow_policy,
+            market_latency: Arc::new(Mutex::new(LatencySamples::default())),
             phantom_event: PhantomData,
         })
     }
@@ -285,6 +360,9 @@ pub struct SystemBuild<Engine, Event, MarketStream> {
 
     /// Futures for initialising `ExecutionBuild` components.
     pub execution_build_futures: ExecutionBuildFutures,
+    pub market_channel_capacity: usize,
+    pub market_overflow_policy: OverflowPolicy,
+    pub market_latency: Arc<Mutex<LatencySamples>>,
 
     phantom_event: PhantomData<Event>,
 }
@@ -316,6 +394,9 @@ where
             market_stream,
             account_channel,
             execution_build_futures,
+            market_channel_capacity: 4096,
+            market_overflow_policy: OverflowPolicy::DropOldest,
+            market_latency: Arc::new(Mutex::new(LatencySamples::default())),
             phantom_event: Default::default(),
         }
     }
@@ -348,6 +429,9 @@ where
             market_stream,
             account_channel,
             execution_build_futures,
+            market_channel_capacity,
+            market_overflow_policy,
+            market_latency,
             phantom_event: _,
         } = self;
 
@@ -357,16 +441,34 @@ where
             .await?;
 
         // Initialise central Engine channel
-        let (feed_tx, mut feed_rx) = mpsc_unbounded();
+        let (feed_tx, mut feed_rx) =
+            mpsc_bounded::<Event>(market_channel_capacity, OverflowPolicy::Block);
 
-        // Forward MarketStreamEvents to Engine feed
-        let market_to_engine = runtime
-            .clone()
-            .spawn(market_stream.forward_to(feed_tx.clone()));
+        // Bound the burst-prone market path while keeping account events lossless on their
+        // dedicated unbounded channel. DropOldest is explicit: the next book update can rebuild
+        // state, while account/order events must never share this overflow policy.
+        let (market_tx, market_rx) =
+            mpsc_bounded::<TimedMarket<Event>>(market_channel_capacity, market_overflow_policy);
+        // Market ingress is bounded and account events are merged separately with priority.
+        // The merger applies backpressure to the central bounded feed without allowing market
+        // overflow policy to discard account/order events.
+        let market_to_engine = runtime.clone().spawn(async move {
+            let _ = market_stream
+                .map(|event| TimedMarket {
+                    event: Event::from(event),
+                    started: Instant::now(),
+                })
+                .forward_to(market_tx)
+                .await;
+        });
 
-        // Forward AccountStreamEvents to Engine feed
         let account_stream = account_channel.rx.into_stream();
-        let account_to_engine = runtime.spawn(account_stream.forward_to(feed_tx.clone()));
+        let account_to_engine = runtime.spawn(merge_event_feeds(
+            market_rx,
+            account_stream,
+            feed_tx.clone(),
+            Arc::clone(&market_latency),
+        ));
 
         // Run Engine in configured mode
         let (engine, audit) = match (engine_feed_mode, audit_mode) {
@@ -434,6 +536,39 @@ where
             },
             feed_tx,
             audit,
+            market_latency,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use barter_integration::channel::{OverflowPolicy, mpsc_bounded};
+    use futures::{StreamExt, stream};
+
+    #[tokio::test]
+    async fn merger_preserves_account_event_during_market_burst() {
+        let (market_tx, market_rx) = mpsc_bounded(2, OverflowPolicy::DropOldest);
+        for value in 0..100u64 {
+            market_tx
+                .try_send(TimedMarket {
+                    event: value,
+                    started: Instant::now(),
+                })
+                .unwrap();
+        }
+        drop(market_tx);
+        let (feed_tx, mut feed_rx) = mpsc_bounded(1, OverflowPolicy::Block);
+        let latency = Arc::new(Mutex::new(LatencySamples::default()));
+        let merger = tokio::spawn(merge_event_feeds(
+            market_rx,
+            stream::iter([999u64]),
+            feed_tx,
+            latency,
+        ));
+        assert_eq!(StreamExt::next(&mut feed_rx).await, Some(999));
+        assert!(StreamExt::next(&mut feed_rx).await.is_some());
+        merger.await.unwrap();
     }
 }

@@ -10,12 +10,6 @@ use serde::{Deserialize, Serialize};
 /// identifiers for an [`Asset`].
 pub mod name;
 
-/// Unique identifier for an [`Asset`].
-#[derive(
-    Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
-)]
-pub struct AssetId(pub u64);
-
 #[derive(
     Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]

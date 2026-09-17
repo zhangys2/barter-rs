@@ -16,7 +16,7 @@ use barter_execution::{
         ExecutionClient,
         mock::{MockExecution, MockExecutionClientConfig, MockExecutionConfig},
     },
-    exchange::mock::{MockExchange, request::MockExchangeRequest},
+    exchange::mock::{MockExchange, market::MockMarketEvent, request::MockExchangeRequest},
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
 };
@@ -32,7 +32,9 @@ use barter_instrument::{
         spec::{InstrumentSpec, InstrumentSpecQuantity, OrderQuantityUnits},
     },
 };
-use barter_integration::channel::{Channel, UnboundedTx, mpsc_unbounded};
+use barter_integration::channel::{
+    BoundedTx, Channel, OverflowPolicy, UnboundedTx, mpsc_bounded, mpsc_unbounded,
+};
 use fnv::FnvHashMap;
 use futures::{FutureExt, future::try_join_all};
 use std::{pin::Pin, sync::Arc, time::Duration};
@@ -63,6 +65,7 @@ type RunFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub struct ExecutionBuilder<'a> {
     instruments: &'a IndexedInstruments,
     execution_txs: FnvHashMap<ExchangeId, (ExchangeIndex, UnboundedTx<ExecutionRequest>)>,
+    mock_market_txs: FnvHashMap<ExchangeId, BoundedTx<MockMarketEvent>>,
     merged_channel: Channel<AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>>,
     mock_exchange_futures: Vec<RunFuture>,
     execution_init_futures: Vec<ExecutionInitFuture>,
@@ -74,6 +77,7 @@ impl<'a> ExecutionBuilder<'a> {
         Self {
             instruments,
             execution_txs: FnvHashMap::default(),
+            mock_market_txs: FnvHashMap::default(),
             merged_channel: Channel::default(),
             mock_exchange_futures: Vec::default(),
             execution_init_futures: Vec::default(),
@@ -96,7 +100,9 @@ impl<'a> ExecutionBuilder<'a> {
         const ACCOUNT_STREAM_CAPACITY: usize = 256;
         const DUMMY_EXECUTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
+        let mocked_exchange = config.mocked_exchange;
         let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (market_tx, market_rx) = mpsc_bounded(4096, OverflowPolicy::DropOldest);
         let (event_tx, event_rx) = broadcast::channel(ACCOUNT_STREAM_CAPACITY);
 
         let mock_execution_client_config = MockExecutionClientConfig {
@@ -107,7 +113,8 @@ impl<'a> ExecutionBuilder<'a> {
         };
 
         // Register MockExchange init Future
-        let mock_exchange_future = self.init_mock_exchange(config, request_rx, event_tx);
+        let mock_exchange_future = self.init_mock_exchange(config, request_rx, market_rx, event_tx);
+        self.mock_market_txs.insert(mocked_exchange, market_tx);
         self.mock_exchange_futures.push(mock_exchange_future);
 
         self.add_execution::<MockExecution<_>>(
@@ -121,11 +128,12 @@ impl<'a> ExecutionBuilder<'a> {
         &self,
         config: MockExecutionConfig,
         request_rx: mpsc::UnboundedReceiver<MockExchangeRequest>,
+        market_rx: barter_integration::channel::BoundedRx<MockMarketEvent>,
         event_tx: broadcast::Sender<UnindexedAccountEvent>,
     ) -> RunFuture {
         let instruments =
             generate_mock_exchange_instruments(self.instruments, config.mocked_exchange);
-        Box::pin(MockExchange::new(config, request_rx, event_tx, instruments).run())
+        Box::pin(MockExchange::new(config, request_rx, market_rx, event_tx, instruments).run())
     }
 
     /// Adds an [`ExecutionManager`] for a live exchange.
@@ -225,6 +233,7 @@ impl<'a> ExecutionBuilder<'a> {
 
         ExecutionBuild {
             execution_tx_map,
+            mock_market_txs: self.mock_market_txs,
             account_channel: self.merged_channel,
             futures: ExecutionBuildFutures {
                 mock_exchange_run_futures: self.mock_exchange_futures,
@@ -241,6 +250,7 @@ impl<'a> ExecutionBuilder<'a> {
 #[allow(missing_debug_implementations)]
 pub struct ExecutionBuild {
     pub execution_tx_map: MultiExchangeTxMap,
+    pub mock_market_txs: FnvHashMap<ExchangeId, BoundedTx<MockMarketEvent>>,
     pub account_channel: Channel<AccountStreamEvent>,
     pub futures: ExecutionBuildFutures,
 }

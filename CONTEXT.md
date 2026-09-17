@@ -57,7 +57,7 @@ _Avoid_: Instrument registry, universe
 A request for one Subscription Kind of data about one Market Data Instrument on one Exchange.
 
 **Subscription Kind**:
-The category of public data subscribed to: Public Trades, Order Books L1, Order Books L2, Order Books L3, Candles or Liquidations.
+The category of public data subscribed to: Public Trades, Order Books L1, Order Books L2, Candles or Liquidations. L3 per-order data is not supported.
 _Avoid_: Channel, feed type
 
 **Market Event**:
@@ -73,7 +73,7 @@ The best bid and best ask for an Instrument.
 _Avoid_: Top of book, BBO, quote
 
 **Order Book**:
-All price Levels for an Instrument — aggregated per price (L2) or per individual order (L3). Arrives as a Snapshot followed by Updates.
+All aggregated price Levels for an Instrument (L2). Arrives as a Snapshot followed by Updates; per-order L3 data is out of scope.
 
 **Level**:
 A price and the total amount resting at that price on one side of an Order Book.

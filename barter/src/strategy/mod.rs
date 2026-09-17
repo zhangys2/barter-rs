@@ -49,7 +49,7 @@ pub mod on_trading_disabled;
 /// - Generates no algorithmic orders (AlgoStrategy).
 /// - Closes positions via the naive [`close_open_positions_with_market_orders`] logic (ClosePositionsStrategy).
 /// - Does nothing when an exchange disconnects (OnDisconnectStrategy).
-/// - Does nothing when trading state is set to disabled (OnDisconnectStrategy).
+/// - Does nothing when trading state is set to disabled (OnTradingDisabled).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DefaultStrategy<State> {
     pub id: StrategyId,

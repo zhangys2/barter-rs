@@ -27,10 +27,17 @@ use crate::{
     execution::builder::{ExecutionBuild, ExecutionBuilder},
     system::builder::{AuditMode, SystemBuild},
 };
-use barter_data::event::MarketEvent;
-use barter_execution::AccountEvent;
+use barter_data::{
+    books::Level,
+    event::{DataKind, MarketEvent},
+    subscription::book::OrderBookEvent,
+};
+use barter_execution::{
+    AccountEvent,
+    exchange::mock::{MockMarketEvent, MockMarketEventKind, MockMarketLevel},
+};
 use barter_instrument::{index::IndexedInstruments, instrument::InstrumentIndex};
-use futures::future::try_join_all;
+use futures::{StreamExt, future::try_join_all};
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
 use std::{fmt::Debug, sync::Arc};
@@ -41,6 +48,39 @@ pub mod market_data;
 
 /// Contains data structures for representing backtest results and metrics.
 pub mod summary;
+
+pub trait IntoMockMarketKind {
+    fn into_mock_market_kind(&self) -> Option<MockMarketEventKind>;
+}
+
+impl IntoMockMarketKind for DataKind {
+    fn into_mock_market_kind(&self) -> Option<MockMarketEventKind> {
+        let book = match self {
+            DataKind::OrderBook(OrderBookEvent::Snapshot(book))
+            | DataKind::OrderBook(OrderBookEvent::Update(book)) => book,
+            _ => return None,
+        };
+        let bids = book
+            .bids()
+            .levels()
+            .iter()
+            .map(|level: &Level| MockMarketLevel {
+                price: level.price,
+                quantity: level.amount,
+            })
+            .collect();
+        let asks = book
+            .asks()
+            .levels()
+            .iter()
+            .map(|level: &Level| MockMarketLevel {
+                price: level.price,
+                quantity: level.amount,
+            })
+            .collect();
+        Some(MockMarketEventKind::OrderBook { bids, asks })
+    }
+}
 
 /// Configuration for constants used across all backtests in a batch.
 ///
@@ -129,6 +169,7 @@ where
         + Send
         + 'static,
     InstrumentData: InstrumentDataState + Default + Send + 'static,
+    InstrumentData::MarketEventKind: IntoMockMarketKind,
 {
     let time_start = std::time::Instant::now();
 
@@ -192,6 +233,7 @@ where
         + Send
         + 'static,
     InstrumentData: InstrumentDataState + Send + 'static,
+    InstrumentData::MarketEventKind: IntoMockMarketKind,
 {
     let clock = args_constant
         .market_data
@@ -203,6 +245,7 @@ where
     // Build Execution infrastructure
     let ExecutionBuild {
         execution_tx_map,
+        mock_market_txs,
         account_channel,
         futures,
     } = args_constant
@@ -213,9 +256,36 @@ where
             ExecutionBuilder::new(&args_constant.instruments),
             |builder, config| match config {
                 ExecutionConfig::Mock(mock_config) => builder.add_mock(mock_config, clock.clone()),
+                ExecutionConfig::BinanceSpot(config) => builder
+                    .add_live::<barter_execution::client::BinanceSpot>(
+                    config,
+                    std::time::Duration::from_secs(5),
+                ),
             },
         )?
         .build();
+
+    // Tee normalized L2 events into the deterministic mock exchange without changing the
+    // engine-facing stream. Non-book market events are intentionally ignored by the L2 simulator.
+    let instruments = args_constant.instruments.clone();
+    let market_stream = market_stream.inspect(move |event| {
+        if let barter_data::streams::reconnect::Event::Item(market_event) = event {
+            if let Some(kind) = market_event.kind.into_mock_market_kind() {
+                if let Some(sender) = mock_market_txs.get(&market_event.exchange) {
+                    if let Some(instrument) = instruments
+                        .instruments()
+                        .get(market_event.instrument.index())
+                    {
+                        let _ = sender.try_send(MockMarketEvent {
+                            instrument: instrument.value.name_exchange.clone(),
+                            time_exchange: market_event.time_exchange,
+                            kind,
+                        });
+                    }
+                }
+            }
+        }
+    });
 
     let engine = Engine::new(
         clock,
@@ -247,4 +317,29 @@ where
         risk_free_return: args_dynamic.risk_free_return,
         trading_summary,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use barter_data::books::OrderBook;
+    use barter_data::subscription::book::OrderBookEvent;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn l2_backtest_bridge_preserves_sorted_levels_deterministically() {
+        let book = OrderBook::new(
+            7,
+            None,
+            [(dec!(10), dec!(2)), (dec!(9), dec!(1))],
+            [(dec!(11), dec!(3)), (dec!(12), dec!(4))],
+        );
+        let kind = DataKind::OrderBook(OrderBookEvent::Snapshot(book));
+        let MockMarketEventKind::OrderBook { bids, asks } = kind.into_mock_market_kind().unwrap()
+        else {
+            panic!("expected L2 order book");
+        };
+        assert_eq!(bids[0].price, dec!(10));
+        assert_eq!(asks[0].price, dec!(11));
+    }
 }

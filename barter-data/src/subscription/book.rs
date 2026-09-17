@@ -84,30 +84,6 @@ impl std::fmt::Display for OrderBooksL2 {
     }
 }
 
-/// Barter [`Subscription`](super::Subscription) [`SubscriptionKind`] that yields
-/// L3 [`OrderBookEvent`] market events.
-///
-/// Level 3 refers to the non-aggregated [`OrderBook`]. This is a direct replication of the exchange
-/// [`OrderBook`].
-#[derive(
-    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, DeSubKind, SerSubKind,
-)]
-pub struct OrderBooksL3;
-
-impl SubscriptionKind for OrderBooksL3 {
-    type Event = OrderBookEvent;
-
-    fn as_str(&self) -> &'static str {
-        "l3"
-    }
-}
-
-impl std::fmt::Display for OrderBooksL3 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub enum OrderBookEvent {
     Snapshot(OrderBook),

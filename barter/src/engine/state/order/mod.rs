@@ -34,7 +34,7 @@ pub mod manager;
 /// 1. OpenInFlight - Initial order request sent to exchange
 /// 2. Open - Order confirmed as open on exchange
 /// 3. CancelInFlight - Cancellation request sent to exchange
-/// 4. Cancelled/Expired/FullyFilled - Terminal states, once achieved order is no longer tracked.
+/// 4. Cancelled/Expired/FullyFilled/Open Failed - Terminal states, once achieved order is no longer tracked.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Constructor)]
 pub struct Orders<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex>(
     pub FnvHashMap<ClientOrderId, Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,
@@ -407,6 +407,7 @@ mod tests {
     };
     use barter_instrument::{Side, exchange::ExchangeId};
     use chrono::{DateTime, Utc};
+    use proptest::prelude::*;
     use rust_decimal_macros::dec;
     use smol_str::SmolStr;
 
@@ -615,6 +616,16 @@ mod tests {
                 cid,
             },
             state: Err(OrderError::Connectivity(ConnectivityError::Timeout)),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn fully_filled_snapshot_removes_any_tracked_order(cid in "[a-z0-9]{1,12}") {
+            let cid = ClientOrderId::new(cid);
+            let mut state = orders([order(cid.clone(), ActiveOrderState::OpenInFlight(OpenInFlight))]);
+            state.update_from_order_snapshot(order_snapshot_fully_filled(cid).as_ref());
+            prop_assert!(state.0.is_empty());
         }
     }
 

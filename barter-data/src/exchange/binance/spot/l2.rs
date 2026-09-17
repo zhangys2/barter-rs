@@ -199,6 +199,18 @@ impl BinanceSpotOrderBookL2Sequencer {
         }
     }
 
+    /// Returns whether a sequence gap requires a fresh exchange snapshot.
+    pub fn needs_snapshot(&self) -> bool {
+        self.updates_processed == u64::MAX
+    }
+
+    /// Reset sequencing after the caller has rebuilt the book from an exchange snapshot.
+    pub fn rebuild_from_snapshot(&mut self, last_update_id: u64) {
+        self.updates_processed = 0;
+        self.last_update_id = last_update_id;
+        self.prev_last_update_id = last_update_id;
+    }
+
     /// BinanceSpot: How To Manage A Local OrderBook Correctly
     /// See Self's Rust Docs for more information on each numbered step
     /// See docs: <https://binance-docs.github.io/apidocs/spot/en/#how-to-manage-a-local-order-book-correctly>
@@ -211,12 +223,16 @@ impl BinanceSpotOrderBookL2Sequencer {
             return Ok(None);
         }
 
-        if self.is_first_update() {
+        let validation = if self.is_first_update() {
             // 5. The first processed event should have U <= lastUpdateId AND u >= lastUpdateId:
-            self.validate_first_update(&update)?;
+            self.validate_first_update(&update)
         } else {
             // 6. Each new event's pu should be equal to the previous event's u:
-            self.validate_next_update(&update)?;
+            self.validate_next_update(&update)
+        };
+        if let Err(error) = validation {
+            self.updates_processed = u64::MAX;
+            return Err(error);
         }
 
         // Update metadata
@@ -354,20 +370,7 @@ mod tests {
 
     #[test]
     fn test_de_binance_spot_order_book_l2_update() {
-        let input = r#"
-            {
-                "e":"depthUpdate",
-                "E":1671656397761,
-                "s":"ETHUSDT",
-                "U":22611425143,
-                "u":22611425151,
-                "b":[
-                    ["1209.67000000","85.48210000"],
-                    ["1209.66000000","20.68790000"]
-                ],
-                "a":[]
-            }
-            "#;
+        let input = include_str!("../../../../tests/fixtures/binance_spot_depth_update.json");
 
         assert_eq!(
             serde_json::from_str::<BinanceSpotOrderBookL2Update>(input).unwrap(),
@@ -389,6 +392,25 @@ mod tests {
                 asks: vec![]
             }
         );
+    }
+
+    #[test]
+    fn sequence_gap_marks_book_for_snapshot_rebuild() {
+        let mut sequencer = BinanceSpotOrderBookL2Sequencer::new(10);
+        let update = |first_update_id, last_update_id| BinanceSpotOrderBookL2Update {
+            subscription_id: SubscriptionId::from("@depth@100ms|ETHUSDT"),
+            time_exchange: DateTime::from_timestamp_millis(1).unwrap(),
+            first_update_id,
+            last_update_id,
+            bids: vec![],
+            asks: vec![],
+        };
+        assert!(sequencer.validate_sequence(update(11, 11)).is_ok());
+        assert!(sequencer.validate_sequence(update(13, 13)).is_err());
+        assert!(sequencer.needs_snapshot());
+        sequencer.rebuild_from_snapshot(13);
+        assert!(!sequencer.needs_snapshot());
+        assert!(sequencer.is_first_update());
     }
 
     #[test]

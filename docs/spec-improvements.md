@@ -38,14 +38,14 @@ Barter's Engine, Engine State and Audit Stream design is sound, but results prod
 
 ## W1 — Mock Exchange correctness (P0)
 
-Verified defects in [`barter-execution/src/exchange/mock/mod.rs`](../barter-execution/src/exchange/mock/mod.rs):
+Verified defects and hazards in [`barter-execution/src/exchange/mock/mod.rs`](../barter-execution/src/exchange/mock/mod.rs):
 
 | # | Defect | Evidence |
 |---|---|---|
 | W1.1 | A Sell debits the **quote** Balance by the **base** quantity (+fees), and reports `BalanceInsufficient` against the quote Asset. The comment says base is required. | `open_order`, `Side::Sell` branch calls `balance_mut(&underlying.quote)` |
-| W1.2 | Only one side of a Trade touches Balances: a Buy debits quote but never credits base; a Sell never credits quote proceeds. Balances drift from reality every Trade. | `open_order` returns a single balance snapshot |
+| W1.2 | The current fill accounting updates only one Balance and never applies the asset credit: a Buy debits quote but does not credit base; a Sell debits quote instead of base and does not credit quote proceeds. Balances drift from reality after every Trade. | `open_order` returns a single balance snapshot |
 | W1.3 | Cancel Requests are logged and dropped; the dropped response channel surfaces to the Engine as `ConnectivityError::ExchangeOffline`, a false connectivity failure. `MockExchange::cancel_order` itself is `unimplemented!()`. | `run`, `CancelOrder` arm; `client/mock/mod.rs` `cancel_order` |
-| W1.4 | `assert_eq!(balance.total, balance.free)` panics the Mock Exchange task as soon as any funds are reserved (i.e. once W2 adds resting orders). | `open_order`, both branches |
+| W1.4 | `assert_eq!(balance.total, balance.free)` is incompatible with reserved funds and will panic the Mock Exchange task once W2 adds resting orders. | `open_order`, both branches |
 | W1.5 | Open responses report `filled_quantity = quantity` and emit a Trade at the **requested** price, regardless of market. (Fixed properly by W2; W1 only documents it.) | `open_order` |
 
 **Requirements**
@@ -56,15 +56,15 @@ Verified defects in [`barter-execution/src/exchange/mock/mod.rs`](../barter-exec
 
 **Acceptance**
 - Unit tests reproducing W1.1–W1.4 fail on `9770b27` and pass after the fix.
-- Property test: for any sequence of accepted Buys and Sells with zero fees, Σ(base × price) + quote is conserved at the fill prices.
+- Property test: for any accepted zero-fee fill, the quote-balance change plus the base-balance change valued at that fill's price is zero; over a sequence, the test accounts for the changing valuation price rather than asserting a single fixed-price wealth invariant.
 
 ## W2 — Realistic fill simulation (P0)
 
 **Problem.** The Mock Exchange never sees market data, so it cannot know the spread, depth or whether a Limit Order would fill.
 
 **Requirements**
-- R2.1 The Mock Exchange receives the same Market Events (per Instrument) as the Engine, in timestamp order, before the Engine acts on them in a Back-Test.
-- R2.2 **Market Orders** fill against the opposite side of the Order Book, walking Levels for size; with only Order Book L1 or Public Trades available, fill at best bid/ask or last trade respectively. Unfillable remainder follows Time In Force.
+- R2.1 In a Back-Test, the Mock Exchange receives the same per-Instrument Market Events as the Engine, in timestamp order, before the corresponding Engine event is processed.
+- R2.2 **Market Orders** fill against the opposite side of the Order Book, walking Levels for size. If only Order Book L1 is available, use the best bid/ask; if only Public Trades are available, use the last trade. Unfillable remainder follows Time In Force.
 - R2.3 **Limit Orders** are accepted, reserve Balance (free < total), rest until crossed, and fill fully or partially. Post-only Orders that would cross are rejected.
 - R2.4 Time In Force: Good Until Cancelled, Immediate Or Cancel, Fill Or Kill honoured; Good Until End Of Day may be deferred (documented).
 - R2.5 **Queue position** is a pluggable model (trait), with at least: `NoQueue` (fill on touch) and a conservative "fill only when traded through" model.
@@ -74,7 +74,7 @@ Verified defects in [`barter-execution/src/exchange/mock/mod.rs`](../barter-exec
 
 **Acceptance**
 - Scenario tests: market Buy larger than best ask walks two Levels at the volume-weighted price; resting Limit Buy fills only after a Public Trade at/below its price (under the conservative model); IOC remainder is Expired; Cancel of a partially filled Order leaves the correct Balance.
-- `backtests_concurrent` example produces byte-identical Trading Summaries across two runs.
+- The `backtests_concurrent` example produces byte-identical Trading Summaries for two runs with identical inputs.
 - Existing examples still run (Market-only Strategies unaffected apart from realistic prices).
 
 **Open question.** Is a mid-level fidelity (L2 + probabilistic queue) enough, or should L3 queue tracking (à la hftbacktest) be in scope? Default: out of scope for this spec.
@@ -83,13 +83,13 @@ Verified defects in [`barter-execution/src/exchange/mock/mod.rs`](../barter-exec
 
 **Requirements**
 - R3.1 Property tests (`proptest`) for **Position**: increase / reduce / exact close / flip; invariants on quantity, average entry price, realised PnL and fees; **Position Exited** emitted exactly when quantity crosses or reaches zero.
-- R3.2 Property/state-machine tests for **Order State**: only legal transitions accepted; out-of-order snapshots never regress a newer state; terminal states (Cancelled, Fully Filled, Open Failed, Expired) remove the Order.
+- R3.2 Property/state-machine tests for **Order State**: only legal transitions are accepted; out-of-order snapshots never regress a newer state; terminal states (Cancelled, Fully Filled, Open Failed, Expired) remove a tracked Order from the active-order collection.
 - R3.3 Golden-file tests per supported Exchange parser: recorded raw messages → expected normalised Market Events, checked into the repo.
 - R3.4 **Connectivity** tests: Reconnecting events set Health and invoke On Disconnect; recovery restores Healthy.
 - R3.5 Order Book sequence-gap test: a gap invalidates the book and triggers snapshot rebuild.
 
 **Acceptance**
-- Every row in `domain-code-map.md` with Evidence = *Unknown* has at least one test and the map is updated.
+- Every *Unknown* row in `domain-code-map.md` that is covered by R3.1–R3.5 has at least one corresponding test, and the map is updated; unrelated Unknown rows are either addressed by a separate workstream or remain explicitly out of scope.
 - CI runs the new tests on every PR.
 
 ## W4 — First live Execution Client (P1)
@@ -99,7 +99,7 @@ Verified defects in [`barter-execution/src/exchange/mock/mod.rs`](../barter-exec
 - R4.2 Support: Account Snapshot, Account Event stream, open Market and Limit Orders, cancel, fetch open Orders / Balances / Trades.
 - R4.3 Request signing and rate-limit handling via `barter-integration` primitives.
 - R4.4 On Account stream reconnect: re-fetch Account Snapshot before resuming, so Engine State cannot miss fills.
-- R4.5 Add an `ExecutionConfig` variant for the live client; config never contains secrets inline (env/file reference).
+- R4.5 Add an `ExecutionConfig` variant for the live client; configuration contains no inline secrets and stores only an environment-variable or file reference.
 
 **Acceptance**
 - Integration tests against the exchange testnet, gated behind a feature flag / env var and excluded from default CI.
@@ -117,17 +117,17 @@ Verified defects in [`barter-execution/src/exchange/mock/mod.rs`](../barter-exec
 - R5.5 Evaluate integer-tick Order Book levels and faster JSON parsing; adopt only with benchmark evidence.
 
 **Acceptance**
-- Under a synthetic 10× burst, memory stays bounded and the chosen policy is observable in metrics.
-- Benchmarks run in CI; a >10% regression fails the job.
+- Under a documented synthetic 10× burst, memory stays bounded and the chosen policy is observable in metrics.
+- Benchmarks run in CI against a recorded baseline; a regression greater than 10% on the agreed benchmark workload fails the job.
 
 ## W6 — Domain and API cleanup (P3)
 
-- R6.1 Remove or adopt `AssetId` / `InstrumentId` (currently unreferenced).
-- R6.2 Decide whether **Health** needs a distinct "never connected" state.
-- R6.3 Decide L3: model per-order data (order id per Level entry) or remove `OrderBooksL3`.
-- R6.4 Fix doc drift: `ExecutionConfig` ("for backtesting" — also used for Paper-Trading), `Orders` lifecycle doc omits Open Failed, `DefaultStrategy` doc cites the wrong trait.
+- R6.1 Remove the unreferenced `AssetId` / `InstrumentId` types; dense `AssetIndex` / `InstrumentIndex` remain the canonical runtime keys.
+- R6.2 Document whether the existing two-state **Health** model (with an initial `Reconnecting` value) is sufficient; add a distinct "never connected" state only if a concrete consumer requires it.
+- R6.3 Remove the unsupported `OrderBooksL3` subscription and document L2 as the simulation fidelity ceiling; per-order queue tracking is out of scope.
+- R6.4 Fix doc drift: the `ExecutionConfig` documentation says it is for backtesting even though it is also used for Paper-Trading; the `Orders` lifecycle documentation omits Open Failed; and the `DefaultStrategy` documentation cites `OnDisconnectStrategy` instead of `OnTradingDisabled` for the disabled-trading behavior.
 
-**Acceptance.** `CONTEXT.md` Flagged ambiguities section has no open items relating to these.
+**Acceptance.** Decisions for R6.1–R6.3 are recorded in the relevant documentation (the glossary where applicable), and no unresolved item in `CONTEXT.md`'s Flagged ambiguities section contradicts them.
 
 ## W7 — CI and tooling (P3)
 
@@ -151,4 +151,3 @@ Verified defects in [`barter-execution/src/exchange/mock/mod.rs`](../barter-exec
 1. Which Exchange first for W4: Binance Spot, Bybit, or OKX?
 2. Keep the fork upstream-compatible (small PRs offered to barter-rs) or diverge freely?
 3. Fill-model fidelity ceiling for W2 (see W2 open question).
-4. Glossary questions still open from domain modeling: unused ids (R6.1), per-exchange Asset scope, Health default (R6.2), definition of Paper-Trading.

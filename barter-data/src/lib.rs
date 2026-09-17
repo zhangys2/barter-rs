@@ -155,7 +155,7 @@ pub mod books;
 /// that works for most `Exchange`-`SubscriptionKind` combinations is included.
 ///
 /// Cases that need custom logic, such as fetching initial [`OrderBooksL2`](subscription::book::OrderBooksL2)
-/// and [`OrderBooksL3`](subscription::book::OrderBooksL3) snapshots on startup, may require custom
+/// and order-book snapshots on startup, may require custom
 /// [`ExchangeTransformer`] implementations.
 /// For examples, see [`Binance`](exchange::binance::Binance) [`OrderBooksL2`](subscription::book::OrderBooksL2)
 /// [`ExchangeTransformer`] implementations for

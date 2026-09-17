@@ -16,10 +16,15 @@ use crate::{
 };
 use barter_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
 use barter_integration::{
-    channel::{Tx, UnboundedRx, UnboundedTx},
+    channel::{BoundedTx, LatencySamples, UnboundedRx},
     collection::{one_or_many::OneOrMany, snapshot::SnapUpdates},
 };
-use std::fmt::Debug;
+use futures::SinkExt;
+use std::{
+    fmt::Debug,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::task::{JoinError, JoinHandle};
 
 /// Provides a `SystemBuilder` for constructing a Barter trading system, and associated types.
@@ -46,11 +51,14 @@ where
     pub handles: SystemAuxillaryHandles,
 
     /// Transmitter for sending events to the `Engine`.
-    pub feed_tx: UnboundedTx<Event>,
+    pub feed_tx: BoundedTx<Event>,
 
     /// Optional audit snapshot with updates (present when audit sending is enabled).
     pub audit:
         Option<SnapUpdates<AuditTick<Engine::Snapshot>, UnboundedRx<AuditTick<Engine::Audit>>>>,
+
+    /// Runtime market-feed transport latency samples.
+    pub market_latency: Arc<Mutex<LatencySamples>>,
 }
 
 impl<Engine, Event> System<Engine, Event>
@@ -58,6 +66,11 @@ where
     Engine: Processor<Event> + Auditor<Engine::Audit, Context = EngineContext>,
     Event: Debug + Clone + Send,
 {
+    /// Return a runtime transport latency percentile for the market feed.
+    pub fn market_latency_percentile(&self, percentile: f64) -> Option<Duration> {
+        self.market_latency.lock().ok()?.percentile(percentile)
+    }
+
     /// Shutdown the `System` gracefully.
     pub async fn shutdown(mut self) -> Result<(Engine, Engine::Audit), JoinError>
     where
@@ -103,16 +116,15 @@ where
                     market_to_engine,
                     account_to_engine,
                 },
-            feed_tx,
+            mut feed_tx,
             audit: _,
+            market_latency: _,
         } = self;
 
         // Wait for MarketStream to finish forwarding to Engine before initiating Shutdown
         market_to_engine.await?;
 
-        feed_tx
-            .send(Shutdown)
-            .expect("Engine cannot drop Feed receiver");
+        let _ = SinkExt::send(&mut feed_tx, Shutdown.into()).await;
         drop(feed_tx);
 
         let (engine, shutdown_audit) = engine.await?;
@@ -183,9 +195,8 @@ where
     where
         T: Into<Event>,
     {
-        self.feed_tx
-            .send(event)
-            .expect("Engine cannot drop Feed receiver")
+        // Synchronous commands wait for central-feed capacity instead of being silently lost.
+        let _ = self.feed_tx.send_blocking(event.into());
     }
 }
 
