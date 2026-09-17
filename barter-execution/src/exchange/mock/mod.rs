@@ -225,17 +225,60 @@ impl MockExchange {
                     notional - fees_quote,
                 ),
             };
-            let Ok(balances) = self.account.apply_fill_balances(
+            let previous_reservation = self.account.reservation(&order.key.cid).cloned();
+            if previous_reservation.is_some() {
+                self.account
+                    .release_reservation(&order.key.cid, self.time_exchange_latest);
+            }
+            let Ok(mut balances) = self.account.apply_fill_balances(
                 &debit_asset,
                 debit_amount,
                 &credit_asset,
                 credit_amount,
                 self.time_exchange_latest,
             ) else {
+                if let Some((asset, amount)) = previous_reservation {
+                    let _ = self.account.reserve_balance(
+                        &order.key.cid,
+                        &asset,
+                        amount,
+                        self.time_exchange_latest,
+                    );
+                }
                 continue;
             };
+            let filled_quantity = order.state.filled_quantity.abs() + quantity;
+            let remaining_after_fill = order.quantity.abs() - filled_quantity;
             if let Some(open) = self.account.open_order_mut(&order.key.cid) {
-                open.state.filled_quantity += quantity;
+                open.state.filled_quantity = filled_quantity;
+            }
+            if remaining_after_fill > Decimal::ZERO {
+                let reservation_amount = match order.side {
+                    Side::Buy => {
+                        remaining_after_fill * order.price * (Decimal::ONE + self.fees_percent)
+                    }
+                    Side::Sell => remaining_after_fill,
+                };
+                if self
+                    .account
+                    .reserve_balance(
+                        &order.key.cid,
+                        &debit_asset,
+                        reservation_amount,
+                        self.time_exchange_latest,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+            }
+            if let Some(balance) = self.account.balance(&debit_asset).cloned() {
+                if let Some(snapshot) = balances
+                    .iter_mut()
+                    .find(|snapshot| snapshot.asset == debit_asset)
+                {
+                    *snapshot = balance;
+                }
             }
             let trade_id = self.order_id_sequence_fetch_add().0;
             let trade = Trade {
@@ -399,6 +442,10 @@ impl MockExchange {
             request.state.id.as_ref(),
             self.time_exchange(),
         );
+        if state.is_ok() {
+            self.account
+                .release_reservation(&request.key.cid, self.time_exchange());
+        }
         OrderEvent { key, state }
     }
 
@@ -480,6 +527,24 @@ impl MockExchange {
                         filled_quantity: Decimal::ZERO,
                     },
                 };
+                let reservation_amount = match order.side {
+                    Side::Buy => {
+                        order.quantity.abs() * order.price * (Decimal::ONE + self.fees_percent)
+                    }
+                    Side::Sell => order.quantity.abs(),
+                };
+                let reservation_asset = match order.side {
+                    Side::Buy => underlying.quote.clone(),
+                    Side::Sell => underlying.base.clone(),
+                };
+                if let Err(error) = self.account.reserve_balance(
+                    &order.key.cid,
+                    &reservation_asset,
+                    reservation_amount,
+                    time_exchange,
+                ) {
+                    return (build_open_order_err_response(request, error), None);
+                }
                 self.account.insert_open_order(order.clone());
                 return (
                     Order {
@@ -771,16 +836,32 @@ mod tests {
         resting.state.time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
         let (response, notifications) = exchange.open_order(resting);
         assert!(response.state.is_ok());
-        // Reservation is part of W2; W1 only verifies that a resting order is accepted.
         assert_eq!(
-            exchange.account.balances().cloned().collect::<Vec<_>>(),
-            balances_before
-        );
-        assert!(
             exchange
                 .account
-                .balances()
-                .all(|balance| balance.balance.free == balance.balance.total)
+                .balance(&AssetNameExchange::from("USDT"))
+                .unwrap()
+                .balance
+                .total,
+            balances_before
+                .iter()
+                .find(|balance| balance.asset == AssetNameExchange::from("USDT"))
+                .unwrap()
+                .balance
+                .total
+        );
+        assert_eq!(
+            exchange
+                .account
+                .balance(&AssetNameExchange::from("USDT"))
+                .unwrap()
+                .balance
+                .free,
+            Decimal::from(9_992)
+        );
+        assert_eq!(
+            exchange.account.reservation(&response.key.cid),
+            Some(&(AssetNameExchange::from("USDT"), Decimal::from(8)))
         );
         assert_eq!(
             response.state.as_ref().unwrap().filled_quantity,
@@ -819,6 +900,89 @@ mod tests {
         );
         assert_eq!(response.price, Decimal::from(7));
         assert!(notifications.is_some());
+    }
+
+    #[tokio::test]
+    async fn partial_resting_fill_adjusts_reservation_and_cancel_releases_remainder() {
+        let mut exchange = exchange();
+        exchange.market_books.insert(
+            InstrumentNameExchange::from("BTCUSDT"),
+            MockOrderBook {
+                asks: vec![MockMarketLevel {
+                    price: Decimal::from(10),
+                    quantity: Decimal::from(2),
+                }],
+                bids: vec![],
+            },
+        );
+
+        let mut resting = request(Side::Buy, 2, 8);
+        resting.state.kind = OrderKind::Limit;
+        resting.state.time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
+        let key = resting.key.clone();
+        let (response, notifications) = exchange.open_order(resting);
+        assert!(response.state.is_ok());
+        assert!(notifications.is_none());
+        assert_eq!(
+            exchange.account.reservation(&key.cid),
+            Some(&(AssetNameExchange::from("USDT"), Decimal::from(16)))
+        );
+        assert_eq!(
+            exchange
+                .account
+                .balance(&AssetNameExchange::from("USDT"))
+                .unwrap()
+                .balance,
+            Balance {
+                total: Decimal::from(10_000),
+                free: Decimal::from(9_984),
+            }
+        );
+
+        exchange.apply_market_event(MockMarketEvent {
+            instrument: InstrumentNameExchange::from("BTCUSDT"),
+            time_exchange: DateTime::<Utc>::UNIX_EPOCH,
+            kind: MockMarketEventKind::OrderBook {
+                bids: vec![],
+                asks: vec![MockMarketLevel {
+                    price: Decimal::from(7),
+                    quantity: Decimal::from(1),
+                }],
+            },
+        });
+        assert_eq!(
+            exchange.account.reservation(&key.cid),
+            Some(&(AssetNameExchange::from("USDT"), Decimal::from(8)))
+        );
+        assert_eq!(
+            exchange
+                .account
+                .balance(&AssetNameExchange::from("USDT"))
+                .unwrap()
+                .balance,
+            Balance {
+                total: Decimal::from(9_993),
+                free: Decimal::from(9_985),
+            }
+        );
+
+        let cancelled = exchange.cancel_order(OrderEvent {
+            key,
+            state: RequestCancel { id: None },
+        });
+        assert!(cancelled.state.is_ok());
+        assert!(exchange.account.reservation(&cancelled.key.cid).is_none());
+        assert_eq!(
+            exchange
+                .account
+                .balance(&AssetNameExchange::from("USDT"))
+                .unwrap()
+                .balance,
+            Balance {
+                total: Decimal::from(9_993),
+                free: Decimal::from(9_993),
+            }
+        );
     }
 
     #[test]

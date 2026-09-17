@@ -24,6 +24,7 @@ pub struct AccountState {
     orders_open: FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Open>>,
     orders_cancelled:
         FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Cancelled>>,
+    reservations: FnvHashMap<ClientOrderId, (AssetNameExchange, rust_decimal::Decimal)>,
     trades: Vec<Trade<QuoteAsset, InstrumentNameExchange>>,
 }
 
@@ -116,6 +117,56 @@ impl AccountState {
         let credit_balance =
             self.apply_balance_delta(credit_asset, credit_amount, time_exchange)?;
         Ok(vec![debit_balance, credit_balance])
+    }
+
+    pub fn reserve_balance(
+        &mut self,
+        cid: &ClientOrderId,
+        asset: &AssetNameExchange,
+        amount: rust_decimal::Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> Result<AssetBalance<AssetNameExchange>, UnindexedOrderError> {
+        let Some(balance) = self.balances.get_mut(asset) else {
+            return Err(ApiError::AssetInvalid(
+                asset.clone(),
+                "MockExchange has no configured balance for this asset".into(),
+            )
+            .into());
+        };
+        if amount < rust_decimal::Decimal::ZERO || balance.balance.free < amount {
+            return Err(ApiError::BalanceInsufficient(
+                asset.clone(),
+                format!(
+                    "Available Balance: {}, Required Balance: {}",
+                    balance.balance.free, amount
+                ),
+            )
+            .into());
+        }
+        balance.balance.free -= amount;
+        balance.time_exchange = time_exchange;
+        self.reservations
+            .insert(cid.clone(), (asset.clone(), amount));
+        Ok(balance.clone())
+    }
+
+    pub fn reservation(
+        &self,
+        cid: &ClientOrderId,
+    ) -> Option<&(AssetNameExchange, rust_decimal::Decimal)> {
+        self.reservations.get(cid)
+    }
+
+    pub fn release_reservation(
+        &mut self,
+        cid: &ClientOrderId,
+        time_exchange: DateTime<Utc>,
+    ) -> Option<AssetBalance<AssetNameExchange>> {
+        let (asset, amount) = self.reservations.remove(cid)?;
+        let balance = self.balances.get_mut(&asset)?;
+        balance.balance.free += amount;
+        balance.time_exchange = time_exchange;
+        Some(balance.clone())
     }
 
     pub fn apply_balance_delta(
@@ -241,6 +292,7 @@ mod tests {
         }
         AccountState::new(
             balances,
+            FnvHashMap::default(),
             FnvHashMap::default(),
             FnvHashMap::default(),
             vec![],
@@ -467,6 +519,7 @@ impl From<UnindexedAccountSnapshot> for AccountState {
             balances,
             orders_open,
             orders_cancelled,
+            reservations: FnvHashMap::default(),
             trades: vec![],
         }
     }
