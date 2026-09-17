@@ -765,11 +765,23 @@ mod tests {
             },
         );
 
+        let balances_before = exchange.account.balances().cloned().collect::<Vec<_>>();
         let mut resting = request(Side::Buy, 1, 8);
         resting.state.kind = OrderKind::Limit;
         resting.state.time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
         let (response, notifications) = exchange.open_order(resting);
         assert!(response.state.is_ok());
+        // Reservation is part of W2; W1 only verifies that a resting order is accepted.
+        assert_eq!(
+            exchange.account.balances().cloned().collect::<Vec<_>>(),
+            balances_before
+        );
+        assert!(
+            exchange
+                .account
+                .balances()
+                .all(|balance| balance.balance.free == balance.balance.total)
+        );
         assert_eq!(
             response.state.as_ref().unwrap().filled_quantity,
             Decimal::ZERO

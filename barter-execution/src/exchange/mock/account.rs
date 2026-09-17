@@ -270,6 +270,42 @@ mod tests {
                 + account.balance(&base).unwrap().balance.free * price;
             prop_assert_eq!(before, after);
         }
+
+        #[test]
+        fn fill_sequence_conserves_value_at_each_changing_fill_price(
+            fills in proptest::collection::vec((1i64..10, 1i64..100, any::<bool>()), 1..8),
+        ) {
+            let mut account = account_with_balances();
+            let base = AssetNameExchange::from("BTC");
+            let quote = AssetNameExchange::from("USDT");
+
+            for (quantity, price, buy) in fills {
+                let quantity = rust_decimal::Decimal::from(quantity);
+                let price = rust_decimal::Decimal::from(price);
+                let before = account.balance(&quote).unwrap().balance.free
+                    + account.balance(&base).unwrap().balance.free * price;
+                if buy {
+                    account.apply_fill_balances(
+                        &quote,
+                        quantity * price,
+                        &base,
+                        quantity,
+                        Utc.timestamp_opt(1, 0).unwrap(),
+                    ).unwrap();
+                } else {
+                    account.apply_fill_balances(
+                        &base,
+                        quantity,
+                        &quote,
+                        quantity * price,
+                        Utc.timestamp_opt(1, 0).unwrap(),
+                    ).unwrap();
+                }
+                let after = account.balance(&quote).unwrap().balance.free
+                    + account.balance(&base).unwrap().balance.free * price;
+                prop_assert_eq!(before, after);
+            }
+        }
     }
 
     #[test]
@@ -362,6 +398,14 @@ mod tests {
         assert_eq!(cancelled.id, order_id);
         assert!(account.orders_open.get(&cid).is_none());
         assert!(account.orders_cancelled.get(&cid).is_some());
+
+        let inactive = account
+            .cancel_order(&cid, Some(&order_id), Utc.timestamp_opt(2, 0).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            inactive,
+            UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+        ));
     }
 }
 
