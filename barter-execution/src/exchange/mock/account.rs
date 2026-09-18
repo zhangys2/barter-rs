@@ -245,6 +245,13 @@ impl AccountState {
         self.orders_open.insert(order.key.cid.clone(), order);
     }
 
+    pub fn remove_filled_order(
+        &mut self,
+        cid: &ClientOrderId,
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+        self.orders_open.remove(cid)
+    }
+
     pub fn restore_reservations(
         &mut self,
         instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,

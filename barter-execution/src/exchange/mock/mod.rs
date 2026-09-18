@@ -12,7 +12,7 @@ use crate::{
         Order, OrderEvent, OrderKind, TimeInForce, UnindexedOrder,
         id::OrderId,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::Open,
+        state::{InactiveOrderState, Open, OrderState},
     },
     trade::{AssetFees, Trade, TradeId},
 };
@@ -153,7 +153,12 @@ impl MockExchange {
                     if delay > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     }
-                    self.apply_market_event(market)
+                    let mut market = market;
+                    let applied = market.applied.take();
+                    self.apply_market_event(market);
+                    if let Some(applied) = applied {
+                        let _ = applied.send(());
+                    }
                 },
                 request = self.request_rx.recv() => {
                     let Some(request) = request else { break; };
@@ -210,7 +215,9 @@ impl MockExchange {
                     self.respond_with_latency(response_tx, response);
 
                     if let Some(notifications) = notifications {
-                        self.account.ack_trade(notifications.trade.clone());
+                        if let Some(trade) = &notifications.trade {
+                            self.account.ack_trade(trade.clone());
+                        }
                         self.send_notifications_with_latency(notifications);
                     }
                 }
@@ -357,6 +364,36 @@ impl MockExchange {
         if let Some(open) = self.account.open_order_mut(&order.key.cid) {
             open.state.filled_quantity = filled_quantity;
         }
+        let order_snapshot = if remaining_after_fill <= Decimal::ZERO {
+            self.account
+                .remove_filled_order(&order.key.cid)
+                .map(|filled| {
+                    Snapshot(Order {
+                        key: filled.key,
+                        side: filled.side,
+                        price: filled.price,
+                        quantity: filled.quantity,
+                        kind: filled.kind,
+                        time_in_force: filled.time_in_force,
+                        state: OrderState::Inactive(InactiveOrderState::FullyFilled),
+                    })
+                })
+        } else {
+            self.account
+                .open_order_mut(&order.key.cid)
+                .cloned()
+                .map(|open| {
+                    Snapshot(Order {
+                        key: open.key,
+                        side: open.side,
+                        price: open.price,
+                        quantity: open.quantity,
+                        kind: open.kind,
+                        time_in_force: open.time_in_force,
+                        state: OrderState::active(open.state),
+                    })
+                })
+        };
         if remaining_after_fill > Decimal::ZERO {
             let reservation_amount = match order.side {
                 Side::Buy => {
@@ -400,7 +437,8 @@ impl MockExchange {
         self.account.ack_trade(trade.clone());
         self.send_notifications_with_latency(OpenOrderNotifications {
             balances: balances.into_iter().map(Snapshot).collect(),
-            trade,
+            trade: Some(trade),
+            order: order_snapshot,
         });
     }
 
@@ -501,7 +539,12 @@ impl MockExchange {
             .into_iter()
             .map(|balance| self.build_account_event(balance))
             .collect::<Vec<_>>();
-        let trade = self.build_account_event(notifications.trade);
+        let trade = notifications
+            .trade
+            .map(|trade| self.build_account_event(trade));
+        let order = notifications
+            .order
+            .map(|order| self.build_account_event(order));
 
         let exchange = self.exchange;
         let latency = std::time::Duration::from_millis(self.effective_latency_ms());
@@ -519,12 +562,23 @@ impl MockExchange {
                 }
             }
 
-            if tx.send(trade).is_err() {
-                error!(
-                    %exchange,
-                    kind = "Trade<QuoteAsset, InstrumentNameExchange>",
-                    "MockExchange failed to send AccountEvent notification to client"
-                );
+            if let Some(trade) = trade {
+                if tx.send(trade).is_err() {
+                    error!(
+                        %exchange,
+                        kind = "Trade<QuoteAsset, InstrumentNameExchange>",
+                        "MockExchange failed to send AccountEvent notification to client"
+                    );
+                }
+            }
+            if let Some(order) = order {
+                if tx.send(order).is_err() {
+                    error!(
+                        %exchange,
+                        kind = "OrderSnapshot",
+                        "MockExchange failed to send OrderSnapshot notification to client"
+                    );
+                }
             }
         });
     }
@@ -890,9 +944,43 @@ impl MockExchange {
             }),
         };
 
+        let order_snapshot = if should_rest {
+            self.account
+                .orders_open()
+                .find(|order| order.key.cid == request.key.cid)
+                .cloned()
+                .map(|open| {
+                    Snapshot(Order {
+                        key: open.key,
+                        side: open.side,
+                        price: open.price,
+                        quantity: open.quantity,
+                        kind: open.kind,
+                        time_in_force: open.time_in_force,
+                        state: OrderState::active(open.state),
+                    })
+                })
+        } else {
+            let inactive = if remaining > Decimal::ZERO
+                && request.state.time_in_force == TimeInForce::ImmediateOrCancel
+            {
+                InactiveOrderState::Expired
+            } else {
+                InactiveOrderState::FullyFilled
+            };
+            Some(Snapshot(Order {
+                key: request.key.clone(),
+                side: request.state.side,
+                price: execution_price,
+                quantity: request.state.quantity,
+                kind: request.state.kind,
+                time_in_force: request.state.time_in_force,
+                state: OrderState::Inactive(inactive),
+            }))
+        };
         let notifications = OpenOrderNotifications {
             balances: balance_snapshots,
-            trade: Trade {
+            trade: Some(Trade {
                 id: trade_id,
                 order_id: order_id.clone(),
                 instrument: request.key.instrument,
@@ -902,7 +990,8 @@ impl MockExchange {
                 price: execution_price,
                 quantity,
                 fees,
-            },
+            }),
+            order: order_snapshot,
         };
 
         (order_response, Some(notifications))
@@ -1062,6 +1151,7 @@ mod tests {
                     quantity: Decimal::from(1),
                 }],
             },
+            applied: None,
         });
         assert_eq!(
             exchange
@@ -1080,17 +1170,9 @@ mod tests {
                 price: Decimal::from(8),
                 quantity: Decimal::from(1),
             },
+            applied: None,
         });
-        assert_eq!(
-            exchange
-                .account
-                .orders_open()
-                .next()
-                .unwrap()
-                .state
-                .filled_quantity,
-            Decimal::ONE
-        );
+        assert_eq!(exchange.account.orders_open().count(), 0);
     }
 
     #[tokio::test]
@@ -1160,15 +1242,15 @@ mod tests {
                     quantity: Decimal::from(1),
                 }],
             },
+            applied: None,
         });
-        let resting_state = exchange.account.orders_open().next().unwrap();
-        assert_eq!(resting_state.state.filled_quantity, Decimal::from(1));
+        assert_eq!(exchange.account.orders_open().count(), 0);
 
         let mut ioc = request(Side::Buy, 1, 6);
         ioc.state.kind = OrderKind::Limit;
         let (response, _) = exchange.open_order(ioc);
         assert!(response.state.is_err());
-        assert_eq!(exchange.account.orders_open().count(), 1);
+        assert_eq!(exchange.account.orders_open().count(), 0);
 
         let mut crossing = request(Side::Buy, 1, 7);
         crossing.state.kind = OrderKind::Limit;
@@ -1349,6 +1431,7 @@ mod tests {
                     quantity: Decimal::from(1),
                 }],
             },
+            applied: None,
         });
         assert_eq!(
             exchange.account.reservation(&key.cid),
@@ -1523,5 +1606,14 @@ where
 #[derive(Debug)]
 pub struct OpenOrderNotifications {
     pub balances: Vec<Snapshot<AssetBalance<AssetNameExchange>>>,
-    pub trade: Trade<QuoteAsset, InstrumentNameExchange>,
+    pub trade: Option<Trade<QuoteAsset, InstrumentNameExchange>>,
+    pub order: Option<
+        Snapshot<
+            Order<
+                ExchangeId,
+                InstrumentNameExchange,
+                OrderState<AssetNameExchange, InstrumentNameExchange>,
+            >,
+        >,
+    >,
 }

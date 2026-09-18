@@ -41,6 +41,7 @@ use futures::{SinkExt, StreamExt, future::try_join_all};
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use smol_str::SmolStr;
 use std::{fmt::Debug, sync::Arc};
+use tokio::sync::oneshot;
 
 /// Defines the interface and implementations for different types of market data sources
 /// that can be used in backtests.
@@ -304,22 +305,28 @@ where
                 .map(|instrument| instrument.value.name_exchange.clone());
             sender.zip(instrument).and_then(|(sender, instrument)| {
                 market_event.kind.into_mock_market_kind().map(|kind| {
-                    (
-                        sender,
-                        MockMarketEvent {
-                            instrument,
-                            time_exchange: market_event.time_exchange,
-                            kind,
-                        },
-                    )
+                    (sender, {
+                        let (applied_tx, applied_rx) = oneshot::channel();
+                        (
+                            MockMarketEvent {
+                                instrument,
+                                time_exchange: market_event.time_exchange,
+                                kind,
+                                applied: Some(applied_tx),
+                            },
+                            applied_rx,
+                        )
+                    })
                 })
             })
         } else {
             None
         };
         async move {
-            if let Some((mut sender, mock_event)) = mock_event {
-                let _ = sender.send(mock_event).await;
+            if let Some((mut sender, (mock_event, applied_rx))) = mock_event {
+                if sender.send(mock_event).await.is_ok() {
+                    let _ = applied_rx.await;
+                }
             }
             event
         }
@@ -423,6 +430,7 @@ mod tests {
                     quantity: dec!(3),
                 }],
             },
+            applied: None,
         };
         let first = serde_json::to_vec(&event).unwrap();
         let second = serde_json::to_vec(&event).unwrap();

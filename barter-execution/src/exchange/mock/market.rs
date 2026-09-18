@@ -2,12 +2,34 @@ use barter_instrument::instrument::name::InstrumentNameExchange;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MockMarketEvent {
     pub instrument: InstrumentNameExchange,
     pub time_exchange: DateTime<Utc>,
     pub kind: MockMarketEventKind,
+    #[serde(skip)]
+    pub applied: Option<oneshot::Sender<()>>,
+}
+
+impl PartialEq for MockMarketEvent {
+    fn eq(&self, other: &Self) -> bool {
+        self.instrument == other.instrument
+            && self.time_exchange == other.time_exchange
+            && self.kind == other.kind
+    }
+}
+
+impl Clone for MockMarketEvent {
+    fn clone(&self) -> Self {
+        Self {
+            instrument: self.instrument.clone(),
+            time_exchange: self.time_exchange,
+            kind: self.kind.clone(),
+            applied: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
