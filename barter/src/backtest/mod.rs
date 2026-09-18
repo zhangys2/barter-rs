@@ -416,25 +416,54 @@ mod tests {
     }
 
     #[test]
-    fn identical_market_inputs_have_byte_identical_mock_events() {
-        let event = MockMarketEvent {
-            instrument: "BTCUSDT".into(),
-            time_exchange: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
-            kind: MockMarketEventKind::OrderBook {
-                bids: vec![MockMarketLevel {
+    fn identical_ordered_market_inputs_have_byte_identical_event_streams() {
+        let inputs = vec![
+            DataKind::OrderBookL1(barter_data::subscription::book::OrderBookL1 {
+                last_update_time: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                best_bid: Some(Level {
                     price: dec!(10),
-                    quantity: dec!(2),
-                }],
-                asks: vec![MockMarketLevel {
+                    amount: dec!(2),
+                }),
+                best_ask: Some(Level {
                     price: dec!(11),
-                    quantity: dec!(3),
-                }],
-            },
-            applied: None,
-        };
-        let first = serde_json::to_vec(&event).unwrap();
-        let second = serde_json::to_vec(&event).unwrap();
-        assert_eq!(first, second);
+                    amount: dec!(3),
+                }),
+            }),
+            DataKind::Trade(PublicTrade {
+                id: "trade-1".into(),
+                price: 10.5,
+                amount: 2.0,
+                side: barter_instrument::Side::Buy,
+            }),
+            DataKind::OrderBook(OrderBookEvent::Snapshot(OrderBook::new(
+                7,
+                None,
+                [(dec!(10), dec!(2)), (dec!(9), dec!(1))],
+                [(dec!(11), dec!(3)), (dec!(12), dec!(4))],
+            ))),
+        ];
+
+        fn encoded_stream(inputs: &[DataKind]) -> Vec<u8> {
+            let events = inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(sequence, input)| {
+                    input.into_mock_market_kind().map(|kind| MockMarketEvent {
+                        instrument: "BTCUSDT".into(),
+                        time_exchange: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+                            + chrono::TimeDelta::seconds(sequence as i64),
+                        kind,
+                        applied: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_vec(&events).unwrap()
+        }
+
+        // The serialized stream represents every bridge output in input order, not just one
+        // event serialized twice. Identical Back-Test input must therefore produce identical
+        // bytes before it is delivered to the deterministic Mock Exchange.
+        assert_eq!(encoded_stream(&inputs), encoded_stream(&inputs));
     }
 
     #[test]
