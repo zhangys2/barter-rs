@@ -1,7 +1,6 @@
-[CmdletBinding()]
 param(
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$CargoArgs
+    [Parameter(Position = 0)]
+    [string]$CargoArgs
 )
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -24,7 +23,7 @@ $command = @(
     'set CC='
     'set AR='
     'set CXX='
-    "cargo $($CargoArgs -join ' ')"
+    "cargo $CargoArgs"
 ) -join ' && '
 
 cmd.exe /d /s /c $command
