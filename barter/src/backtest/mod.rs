@@ -37,8 +37,8 @@ use barter_execution::{
     exchange::mock::{MockMarketEvent, MockMarketEventKind, MockMarketLevel},
 };
 use barter_instrument::{index::IndexedInstruments, instrument::InstrumentIndex};
-use futures::{StreamExt, future::try_join_all};
-use rust_decimal::Decimal;
+use futures::{SinkExt, StreamExt, future::try_join_all};
+use rust_decimal::{Decimal, prelude::FromPrimitive};
 use smol_str::SmolStr;
 use std::{fmt::Debug, sync::Arc};
 
@@ -55,30 +55,55 @@ pub trait IntoMockMarketKind {
 
 impl IntoMockMarketKind for DataKind {
     fn into_mock_market_kind(&self) -> Option<MockMarketEventKind> {
-        let book = match self {
+        match self {
+            DataKind::Trade(trade) => Some(MockMarketEventKind::Trade {
+                price: Decimal::from_f64(trade.price)?,
+                quantity: Decimal::from_f64(trade.amount)?.abs(),
+            }),
+            DataKind::OrderBookL1(book) => Some(MockMarketEventKind::OrderBook {
+                bids: book
+                    .best_bid
+                    .map(|level| {
+                        vec![MockMarketLevel {
+                            price: level.price,
+                            quantity: level.amount,
+                        }]
+                    })
+                    .unwrap_or_default(),
+                asks: book
+                    .best_ask
+                    .map(|level| {
+                        vec![MockMarketLevel {
+                            price: level.price,
+                            quantity: level.amount,
+                        }]
+                    })
+                    .unwrap_or_default(),
+            }),
             DataKind::OrderBook(OrderBookEvent::Snapshot(book))
-            | DataKind::OrderBook(OrderBookEvent::Update(book)) => book,
-            _ => return None,
-        };
-        let bids = book
-            .bids()
-            .levels()
-            .iter()
-            .map(|level: &Level| MockMarketLevel {
-                price: level.price,
-                quantity: level.amount,
-            })
-            .collect();
-        let asks = book
-            .asks()
-            .levels()
-            .iter()
-            .map(|level: &Level| MockMarketLevel {
-                price: level.price,
-                quantity: level.amount,
-            })
-            .collect();
-        Some(MockMarketEventKind::OrderBook { bids, asks })
+            | DataKind::OrderBook(OrderBookEvent::Update(book)) => {
+                let bids = book
+                    .bids()
+                    .levels()
+                    .iter()
+                    .map(|level: &Level| MockMarketLevel {
+                        price: level.price,
+                        quantity: level.amount,
+                    })
+                    .collect();
+                let asks = book
+                    .asks()
+                    .levels()
+                    .iter()
+                    .map(|level: &Level| MockMarketLevel {
+                        price: level.price,
+                        quantity: level.amount,
+                    })
+                    .collect();
+                Some(MockMarketEventKind::OrderBook { bids, asks })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -265,25 +290,38 @@ where
         )?
         .build();
 
-    // Tee normalized L2 events into the deterministic mock exchange without changing the
-    // engine-facing stream. Non-book market events are intentionally ignored by the L2 simulator.
+    // Deliver each market event to the Mock Exchange before yielding it to the Engine. Awaiting
+    // the bounded send preserves event ordering and prevents a burst from silently dropping the
+    // book update that determines a corresponding fill.
     let instruments = args_constant.instruments.clone();
-    let market_stream = market_stream.inspect(move |event| {
-        if let barter_data::streams::reconnect::Event::Item(market_event) = event {
-            if let Some(kind) = market_event.kind.into_mock_market_kind() {
-                if let Some(sender) = mock_market_txs.get(&market_event.exchange) {
-                    if let Some(instrument) = instruments
-                        .instruments()
-                        .get(market_event.instrument.index())
-                    {
-                        let _ = sender.try_send(MockMarketEvent {
-                            instrument: instrument.value.name_exchange.clone(),
+    let market_stream = market_stream.then(move |event| {
+        let mock_event = if let barter_data::streams::reconnect::Event::Item(market_event) = &event
+        {
+            let sender = mock_market_txs.get(&market_event.exchange).cloned();
+            let instrument = instruments
+                .instruments()
+                .get(market_event.instrument.index())
+                .map(|instrument| instrument.value.name_exchange.clone());
+            sender.zip(instrument).and_then(|(sender, instrument)| {
+                market_event.kind.into_mock_market_kind().map(|kind| {
+                    (
+                        sender,
+                        MockMarketEvent {
+                            instrument,
                             time_exchange: market_event.time_exchange,
                             kind,
-                        });
-                    }
-                }
+                        },
+                    )
+                })
+            })
+        } else {
+            None
+        };
+        async move {
+            if let Some((mut sender, mock_event)) = mock_event {
+                let _ = sender.send(mock_event).await;
             }
+            event
         }
     });
 
@@ -323,8 +361,73 @@ where
 mod tests {
     use super::*;
     use barter_data::books::OrderBook;
-    use barter_data::subscription::book::OrderBookEvent;
+    use barter_data::{
+        event::DataKind,
+        subscription::{book::OrderBookEvent, trade::PublicTrade},
+    };
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn market_data_bridge_supports_l1_and_public_trades() {
+        let l1 = DataKind::OrderBookL1(barter_data::subscription::book::OrderBookL1 {
+            last_update_time: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            best_bid: Some(Level {
+                price: dec!(10),
+                amount: dec!(2),
+            }),
+            best_ask: Some(Level {
+                price: dec!(11),
+                amount: dec!(3),
+            }),
+        });
+        assert_eq!(
+            l1.into_mock_market_kind(),
+            Some(MockMarketEventKind::OrderBook {
+                bids: vec![MockMarketLevel {
+                    price: dec!(10),
+                    quantity: dec!(2),
+                }],
+                asks: vec![MockMarketLevel {
+                    price: dec!(11),
+                    quantity: dec!(3),
+                }],
+            })
+        );
+        let trade = DataKind::Trade(PublicTrade {
+            id: "trade-1".into(),
+            price: 10.5,
+            amount: 2.0,
+            side: barter_instrument::Side::Buy,
+        });
+        assert_eq!(
+            trade.into_mock_market_kind(),
+            Some(MockMarketEventKind::Trade {
+                price: dec!(10.5),
+                quantity: dec!(2),
+            })
+        );
+    }
+
+    #[test]
+    fn identical_market_inputs_have_byte_identical_mock_events() {
+        let event = MockMarketEvent {
+            instrument: "BTCUSDT".into(),
+            time_exchange: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            kind: MockMarketEventKind::OrderBook {
+                bids: vec![MockMarketLevel {
+                    price: dec!(10),
+                    quantity: dec!(2),
+                }],
+                asks: vec![MockMarketLevel {
+                    price: dec!(11),
+                    quantity: dec!(3),
+                }],
+            },
+        };
+        let first = serde_json::to_vec(&event).unwrap();
+        let second = serde_json::to_vec(&event).unwrap();
+        assert_eq!(first, second);
+    }
 
     #[test]
     fn l2_backtest_bridge_preserves_sorted_levels_deterministically() {

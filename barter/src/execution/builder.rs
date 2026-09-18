@@ -102,7 +102,9 @@ impl<'a> ExecutionBuilder<'a> {
 
         let mocked_exchange = config.mocked_exchange;
         let (request_tx, request_rx) = mpsc::unbounded_channel();
-        let (market_tx, market_rx) = mpsc_bounded(4096, OverflowPolicy::DropOldest);
+        // Mock market data is part of the fill decision and must not be dropped or
+        // reordered ahead of the corresponding Engine event.
+        let (market_tx, market_rx) = mpsc_bounded(4096, OverflowPolicy::Block);
         let (event_tx, event_rx) = broadcast::channel(ACCOUNT_STREAM_CAPACITY);
 
         let mock_execution_client_config = MockExecutionClientConfig {

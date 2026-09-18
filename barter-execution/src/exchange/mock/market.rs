@@ -1,15 +1,16 @@
 use barter_instrument::instrument::name::InstrumentNameExchange;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MockMarketEvent {
     pub instrument: InstrumentNameExchange,
     pub time_exchange: DateTime<Utc>,
     pub kind: MockMarketEventKind,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MockMarketEventKind {
     OrderBook {
         bids: Vec<MockMarketLevel>,
@@ -22,14 +23,45 @@ pub enum MockMarketEventKind {
 }
 
 pub trait QueueModel: Send + Sync {
+    /// Quantity available when a resting order is touched by an order-book update.
     fn executable_quantity(&self, available: Decimal, requested: Decimal) -> Decimal;
+
+    /// Quantity available when a public trade occurs at `trade_price`.
+    fn executable_trade_quantity(
+        &self,
+        available: Decimal,
+        requested: Decimal,
+        side: barter_instrument::Side,
+        order_price: Decimal,
+        trade_price: Decimal,
+    ) -> Decimal {
+        let _ = (available, requested, side, order_price, trade_price);
+        Decimal::ZERO
+    }
 }
 
+/// Fill a resting order as soon as its price is touched by the current book.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct PriceTimeQueue;
+pub struct NoQueue;
+
+/// Conservative queue model: a resting order only fills after public volume trades
+/// through its limit price. Book updates alone never fill it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConservativeQueue;
+
+/// Backwards-compatible name for the historical touch-fill model.
+pub type PriceTimeQueue = NoQueue;
 
 pub trait LatencyModel: Send + Sync + std::fmt::Debug {
     fn delay_ms(&self, configured_ms: u64) -> u64;
+
+    fn feed_delay_ms(&self, configured_ms: u64) -> u64 {
+        self.delay_ms(configured_ms)
+    }
+
+    fn order_delay_ms(&self, configured_ms: u64) -> u64 {
+        self.delay_ms(configured_ms)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -41,13 +73,36 @@ impl LatencyModel for FixedLatency {
     }
 }
 
-impl QueueModel for PriceTimeQueue {
+impl QueueModel for NoQueue {
     fn executable_quantity(&self, available: Decimal, requested: Decimal) -> Decimal {
         available.min(requested)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+impl QueueModel for ConservativeQueue {
+    fn executable_quantity(&self, _available: Decimal, _requested: Decimal) -> Decimal {
+        Decimal::ZERO
+    }
+
+    fn executable_trade_quantity(
+        &self,
+        available: Decimal,
+        requested: Decimal,
+        side: barter_instrument::Side,
+        order_price: Decimal,
+        trade_price: Decimal,
+    ) -> Decimal {
+        let crossed = match side {
+            barter_instrument::Side::Buy => trade_price <= order_price,
+            barter_instrument::Side::Sell => trade_price >= order_price,
+        };
+        crossed
+            .then_some(available.min(requested))
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MockMarketLevel {
     pub price: Decimal,
     pub quantity: Decimal,
@@ -79,10 +134,10 @@ impl MockOrderBook {
         quantity: Decimal,
         max_price: Option<Decimal>,
     ) -> Option<(Decimal, Decimal)> {
-        self.walk_asks_until_with(quantity, max_price, &PriceTimeQueue)
+        self.walk_asks_until_with(quantity, max_price, &NoQueue)
     }
 
-    pub fn walk_asks_until_with<Q: QueueModel>(
+    pub fn walk_asks_until_with<Q: QueueModel + ?Sized>(
         &self,
         mut quantity: Decimal,
         max_price: Option<Decimal>,
@@ -119,10 +174,10 @@ impl MockOrderBook {
         quantity: Decimal,
         min_price: Option<Decimal>,
     ) -> Option<(Decimal, Decimal)> {
-        self.walk_bids_until_with(quantity, min_price, &PriceTimeQueue)
+        self.walk_bids_until_with(quantity, min_price, &NoQueue)
     }
 
-    pub fn walk_bids_until_with<Q: QueueModel>(
+    pub fn walk_bids_until_with<Q: QueueModel + ?Sized>(
         &self,
         mut quantity: Decimal,
         min_price: Option<Decimal>,
@@ -182,5 +237,62 @@ mod tests {
             .walk_asks_until_with(Decimal::from(2), None, &HalfQueue)
             .unwrap();
         assert_eq!(filled, Decimal::from(2));
+    }
+
+    #[test]
+    fn latency_model_exposes_independent_feed_and_order_delays() {
+        #[derive(Debug)]
+        struct SplitLatency;
+        impl LatencyModel for SplitLatency {
+            fn delay_ms(&self, configured_ms: u64) -> u64 {
+                configured_ms
+            }
+
+            fn feed_delay_ms(&self, _configured_ms: u64) -> u64 {
+                3
+            }
+
+            fn order_delay_ms(&self, _configured_ms: u64) -> u64 {
+                7
+            }
+        }
+        let model = SplitLatency;
+        assert_eq!(model.feed_delay_ms(100), 3);
+        assert_eq!(model.order_delay_ms(100), 7);
+    }
+
+    #[test]
+    fn conservative_queue_waits_for_trade_through() {
+        let book = MockOrderBook {
+            asks: vec![MockMarketLevel {
+                price: Decimal::from(10),
+                quantity: Decimal::from(5),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            book.walk_asks_until_with(Decimal::from(2), None, &ConservativeQueue),
+            None
+        );
+        assert_eq!(
+            ConservativeQueue.executable_trade_quantity(
+                Decimal::from(3),
+                Decimal::from(2),
+                barter_instrument::Side::Buy,
+                Decimal::from(10),
+                Decimal::from(9),
+            ),
+            Decimal::from(2)
+        );
+        assert_eq!(
+            ConservativeQueue.executable_trade_quantity(
+                Decimal::from(3),
+                Decimal::from(2),
+                barter_instrument::Side::Buy,
+                Decimal::from(10),
+                Decimal::from(11),
+            ),
+            Decimal::ZERO
+        );
     }
 }

@@ -29,7 +29,10 @@ use futures::stream::BoxStream;
 use itertools::Itertools;
 use rust_decimal::Decimal;
 use smol_str::ToSmolStr;
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::{self, Debug},
+    sync::Arc,
+};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{error, info};
@@ -37,16 +40,16 @@ use tracing::{error, info};
 pub mod account;
 pub mod market;
 pub use market::{
-    FixedLatency, LatencyModel, MockMarketEvent, MockMarketEventKind, MockMarketLevel,
-    PriceTimeQueue, QueueModel,
+    ConservativeQueue, FixedLatency, LatencyModel, MockMarketEvent, MockMarketEventKind,
+    MockMarketLevel, NoQueue, PriceTimeQueue, QueueModel,
 };
 pub mod request;
 
-#[derive(Debug)]
 pub struct MockExchange {
     pub exchange: ExchangeId,
     pub latency_ms: u64,
     pub latency_model: Arc<dyn LatencyModel>,
+    pub queue_model: Arc<dyn QueueModel>,
     pub fees_percent: Decimal,
     pub request_rx: mpsc::UnboundedReceiver<MockExchangeRequest>,
     pub market_rx: BoundedRx<MockMarketEvent>,
@@ -56,6 +59,22 @@ pub struct MockExchange {
     pub order_sequence: u64,
     pub time_exchange_latest: DateTime<Utc>,
     pub market_books: FnvHashMap<InstrumentNameExchange, MockOrderBook>,
+    pub last_trades: FnvHashMap<InstrumentNameExchange, Decimal>,
+}
+
+impl fmt::Debug for MockExchange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MockExchange")
+            .field("exchange", &self.exchange)
+            .field("latency_ms", &self.latency_ms)
+            .field("fees_percent", &self.fees_percent)
+            .field("order_sequence", &self.order_sequence)
+            .field("time_exchange_latest", &self.time_exchange_latest)
+            .field("market_books", &self.market_books)
+            .field("last_trades", &self.last_trades)
+            .finish()
+    }
 }
 
 impl MockExchange {
@@ -84,6 +103,26 @@ impl MockExchange {
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
         latency_model: Arc<dyn LatencyModel>,
     ) -> Self {
+        Self::new_with_models(
+            config,
+            request_rx,
+            market_rx,
+            event_tx,
+            instruments,
+            latency_model,
+            Arc::new(NoQueue),
+        )
+    }
+
+    pub fn new_with_models(
+        config: MockExecutionConfig,
+        request_rx: mpsc::UnboundedReceiver<MockExchangeRequest>,
+        market_rx: BoundedRx<MockMarketEvent>,
+        event_tx: broadcast::Sender<UnindexedAccountEvent>,
+        instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+        latency_model: Arc<dyn LatencyModel>,
+        queue_model: Arc<dyn QueueModel>,
+    ) -> Self {
         let fees_percent = config.fees_percent;
         let mut account = AccountState::from(config.initial_state);
         account.restore_reservations(&instruments, fees_percent, DateTime::<Utc>::UNIX_EPOCH);
@@ -92,6 +131,7 @@ impl MockExchange {
             exchange: config.mocked_exchange,
             latency_ms: config.latency_ms,
             latency_model,
+            queue_model,
             fees_percent,
             request_rx,
             market_rx,
@@ -101,13 +141,20 @@ impl MockExchange {
             order_sequence: 0,
             time_exchange_latest: Default::default(),
             market_books: FnvHashMap::default(),
+            last_trades: FnvHashMap::default(),
         }
     }
 
     pub async fn run(mut self) {
         loop {
             tokio::select! {
-                Some(market) = tokio_stream::StreamExt::next(&mut self.market_rx) => self.apply_market_event(market),
+                Some(market) = tokio_stream::StreamExt::next(&mut self.market_rx) => {
+                    let delay = self.effective_feed_latency_ms();
+                    if delay > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                    self.apply_market_event(market)
+                },
                 request = self.request_rx.recv() => {
                     let Some(request) = request else { break; };
                     self.update_time_exchange(request.time_request);
@@ -177,12 +224,18 @@ impl MockExchange {
 
     fn apply_market_event(&mut self, event: MockMarketEvent) {
         self.time_exchange_latest = event.time_exchange;
-        if let MockMarketEventKind::OrderBook { .. } = &event.kind {
-            self.market_books
-                .entry(event.instrument.clone())
-                .or_default()
-                .update(event.kind);
-            self.fill_resting_orders(&event.instrument);
+        match event.kind {
+            MockMarketEventKind::OrderBook { bids, asks } => {
+                self.market_books
+                    .entry(event.instrument.clone())
+                    .or_default()
+                    .update(MockMarketEventKind::OrderBook { bids, asks });
+                self.fill_resting_orders(&event.instrument);
+            }
+            MockMarketEventKind::Trade { price, quantity } => {
+                self.last_trades.insert(event.instrument.clone(), price);
+                self.fill_resting_orders_on_trade(&event.instrument, price, quantity);
+            }
         }
     }
 
@@ -196,112 +249,159 @@ impl MockExchange {
             .filter(|order| &order.key.instrument == instrument)
             .cloned()
             .collect();
-
         for order in orders {
             let remaining = order.quantity.abs() - order.state.filled_quantity.abs();
             if remaining <= Decimal::ZERO {
                 continue;
             }
             let fill = match order.side {
-                Side::Buy => book.walk_asks_until(remaining, Some(order.price)),
-                Side::Sell => book.walk_bids_until(remaining, Some(order.price)),
-            };
-            let Some((quantity, price)) = fill else {
-                continue;
-            };
-            let Some(instrument_data) = self.instruments.get(instrument) else {
-                continue;
-            };
-            let underlying = instrument_data.underlying.clone();
-            let notional = quantity * price;
-            let fees_quote = notional * self.fees_percent;
-            let (debit_asset, debit_amount, credit_asset, credit_amount) = match order.side {
-                Side::Buy => (
-                    underlying.quote.clone(),
-                    notional + fees_quote,
-                    underlying.base.clone(),
-                    quantity,
+                Side::Buy => book.walk_asks_until_with(
+                    remaining,
+                    Some(order.price),
+                    self.queue_model.as_ref(),
                 ),
-                Side::Sell => (
-                    underlying.base.clone(),
-                    quantity,
-                    underlying.quote.clone(),
-                    notional - fees_quote,
+                Side::Sell => book.walk_bids_until_with(
+                    remaining,
+                    Some(order.price),
+                    self.queue_model.as_ref(),
                 ),
             };
-            let previous_reservation = self.account.reservation(&order.key.cid).cloned();
-            if previous_reservation.is_some() {
-                self.account
-                    .release_reservation(&order.key.cid, self.time_exchange_latest);
+            if let Some((quantity, price)) = fill {
+                self.fill_resting_order(&order, quantity, price);
             }
-            let Ok(mut balances) = self.account.apply_fill_balances(
-                &debit_asset,
-                debit_amount,
-                &credit_asset,
-                credit_amount,
-                self.time_exchange_latest,
-            ) else {
-                if let Some((asset, amount)) = previous_reservation {
-                    let _ = self.account.reserve_balance(
-                        &order.key.cid,
-                        &asset,
-                        amount,
-                        self.time_exchange_latest,
-                    );
-                }
-                continue;
-            };
-            let filled_quantity = order.state.filled_quantity.abs() + quantity;
-            let remaining_after_fill = order.quantity.abs() - filled_quantity;
-            if let Some(open) = self.account.open_order_mut(&order.key.cid) {
-                open.state.filled_quantity = filled_quantity;
-            }
-            if remaining_after_fill > Decimal::ZERO {
-                let reservation_amount = match order.side {
-                    Side::Buy => {
-                        remaining_after_fill * order.price * (Decimal::ONE + self.fees_percent)
-                    }
-                    Side::Sell => remaining_after_fill,
-                };
-                if self
-                    .account
-                    .reserve_balance(
-                        &order.key.cid,
-                        &debit_asset,
-                        reservation_amount,
-                        self.time_exchange_latest,
-                    )
-                    .is_err()
-                {
-                    continue;
-                }
-            }
-            if let Some(balance) = self.account.balance(&debit_asset).cloned() {
-                if let Some(snapshot) = balances
-                    .iter_mut()
-                    .find(|snapshot| snapshot.asset == debit_asset)
-                {
-                    *snapshot = balance;
-                }
-            }
-            let trade_id = self.order_id_sequence_fetch_add().0;
-            let trade = Trade {
-                id: TradeId(trade_id.clone()),
-                order_id: order.state.id.clone(),
-                instrument: order.key.instrument.clone(),
-                strategy: order.key.strategy.clone(),
-                time_exchange: self.time_exchange_latest,
-                side: order.side,
-                price,
-                quantity,
-                fees: AssetFees::quote_fees(fees_quote),
-            };
-            self.account.ack_trade(trade.clone());
-            self.send_notifications_with_latency(OpenOrderNotifications {
-                balances: balances.into_iter().map(Snapshot).collect(),
-                trade,
-            });
         }
+    }
+
+    fn fill_resting_orders_on_trade(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        trade_price: Decimal,
+        trade_quantity: Decimal,
+    ) {
+        let orders: Vec<_> = self
+            .account
+            .orders_open()
+            .filter(|order| &order.key.instrument == instrument)
+            .cloned()
+            .collect();
+        let mut remaining_trade = trade_quantity;
+        for order in orders {
+            if remaining_trade <= Decimal::ZERO {
+                break;
+            }
+            let remaining = order.quantity.abs() - order.state.filled_quantity.abs();
+            let quantity = self.queue_model.executable_trade_quantity(
+                remaining_trade,
+                remaining,
+                order.side,
+                order.price,
+                trade_price,
+            );
+            if quantity > Decimal::ZERO {
+                remaining_trade -= quantity;
+                self.fill_resting_order(&order, quantity, order.price);
+            }
+        }
+    }
+
+    fn fill_resting_order(
+        &mut self,
+        order: &Order<ExchangeId, InstrumentNameExchange, Open>,
+        quantity: Decimal,
+        price: Decimal,
+    ) {
+        let Some(instrument_data) = self.instruments.get(&order.key.instrument) else {
+            return;
+        };
+        let underlying = instrument_data.underlying.clone();
+        let notional = quantity * price;
+        let fees_quote = notional * self.fees_percent;
+        let (debit_asset, debit_amount, credit_asset, credit_amount) = match order.side {
+            Side::Buy => (
+                underlying.quote.clone(),
+                notional + fees_quote,
+                underlying.base.clone(),
+                quantity,
+            ),
+            Side::Sell => (
+                underlying.base.clone(),
+                quantity,
+                underlying.quote.clone(),
+                notional - fees_quote,
+            ),
+        };
+        let previous_reservation = self.account.reservation(&order.key.cid).cloned();
+        if previous_reservation.is_some() {
+            self.account
+                .release_reservation(&order.key.cid, self.time_exchange_latest);
+        }
+        let Ok(mut balances) = self.account.apply_fill_balances(
+            &debit_asset,
+            debit_amount,
+            &credit_asset,
+            credit_amount,
+            self.time_exchange_latest,
+        ) else {
+            if let Some((asset, amount)) = previous_reservation {
+                let _ = self.account.reserve_balance(
+                    &order.key.cid,
+                    &asset,
+                    amount,
+                    self.time_exchange_latest,
+                );
+            }
+            return;
+        };
+        let filled_quantity = order.state.filled_quantity.abs() + quantity;
+        let remaining_after_fill = order.quantity.abs() - filled_quantity;
+        if let Some(open) = self.account.open_order_mut(&order.key.cid) {
+            open.state.filled_quantity = filled_quantity;
+        }
+        if remaining_after_fill > Decimal::ZERO {
+            let reservation_amount = match order.side {
+                Side::Buy => {
+                    remaining_after_fill * order.price * (Decimal::ONE + self.fees_percent)
+                }
+                Side::Sell => remaining_after_fill,
+            };
+            if self
+                .account
+                .reserve_balance(
+                    &order.key.cid,
+                    &debit_asset,
+                    reservation_amount,
+                    self.time_exchange_latest,
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+        if let Some(balance) = self.account.balance(&debit_asset).cloned() {
+            if let Some(snapshot) = balances
+                .iter_mut()
+                .find(|snapshot| snapshot.asset == debit_asset)
+            {
+                *snapshot = balance;
+            }
+        }
+        let trade_id = self.order_id_sequence_fetch_add().0;
+        let trade = Trade {
+            id: TradeId(trade_id.clone()),
+            order_id: order.state.id.clone(),
+            instrument: order.key.instrument.clone(),
+            strategy: order.key.strategy.clone(),
+            time_exchange: self.time_exchange_latest,
+            side: order.side,
+            price,
+            quantity,
+            fees: AssetFees::quote_fees(fees_quote),
+        };
+        self.account.ack_trade(trade.clone());
+        self.send_notifications_with_latency(OpenOrderNotifications {
+            balances: balances.into_iter().map(Snapshot).collect(),
+            trade,
+        });
     }
 
     fn update_time_exchange(&mut self, time_request: DateTime<Utc>) {
@@ -314,8 +414,16 @@ impl MockExchange {
         self.account.update_time_exchange(self.time_exchange_latest)
     }
 
+    fn effective_feed_latency_ms(&self) -> u64 {
+        self.latency_model.feed_delay_ms(self.latency_ms)
+    }
+
+    fn effective_order_latency_ms(&self) -> u64 {
+        self.latency_model.order_delay_ms(self.latency_ms)
+    }
+
     fn effective_latency_ms(&self) -> u64 {
-        self.latency_model.delay_ms(self.latency_ms)
+        self.effective_order_latency_ms()
     }
 
     pub fn time_exchange(&self) -> DateTime<Utc> {
@@ -493,25 +601,73 @@ impl MockExchange {
 
         let requested_quantity = request.state.quantity.abs();
         let (quantity, execution_price) = if request.state.kind == OrderKind::Market {
-            self.market_books
+            let fill = self
+                .market_books
                 .get(&request.key.instrument)
                 .and_then(|book| match request.state.side {
-                    Side::Buy => book.walk_asks_until(requested_quantity, None),
-                    Side::Sell => book.walk_bids_until(requested_quantity, None),
+                    Side::Buy => book.walk_asks_until_with(requested_quantity, None, &NoQueue),
+                    Side::Sell => book.walk_bids_until_with(requested_quantity, None, &NoQueue),
                 })
-                .unwrap_or((requested_quantity, request.state.price))
+                .or_else(|| {
+                    self.last_trades
+                        .get(&request.key.instrument)
+                        .copied()
+                        .map(|price| (requested_quantity, price))
+                });
+            let Some((quantity, execution_price)) = fill else {
+                return (
+                    build_open_order_err_response(
+                        request,
+                        ApiError::OrderRejected(
+                            "market data is unavailable for this instrument".into(),
+                        ),
+                    ),
+                    None,
+                );
+            };
+            if matches!(request.state.time_in_force, TimeInForce::FillOrKill)
+                && quantity < requested_quantity
+            {
+                return (
+                    build_open_order_err_response(
+                        request,
+                        ApiError::OrderRejected(
+                            "market fill-or-kill was only partially executable".into(),
+                        ),
+                    ),
+                    None,
+                );
+            }
+            (quantity, execution_price)
         } else {
             let fill =
                 self.market_books
                     .get(&request.key.instrument)
                     .and_then(|book| match request.state.side {
-                        Side::Buy => {
-                            book.walk_asks_until(requested_quantity, Some(request.state.price))
-                        }
-                        Side::Sell => {
-                            book.walk_bids_until(requested_quantity, Some(request.state.price))
-                        }
+                        Side::Buy => book.walk_asks_until_with(
+                            requested_quantity,
+                            Some(request.state.price),
+                            &NoQueue,
+                        ),
+                        Side::Sell => book.walk_bids_until_with(
+                            requested_quantity,
+                            Some(request.state.price),
+                            &NoQueue,
+                        ),
                     });
+            if request.state.time_in_force == (TimeInForce::GoodUntilCancelled { post_only: true })
+                && fill.is_some()
+            {
+                return (
+                    build_open_order_err_response(
+                        request,
+                        ApiError::OrderRejected(
+                            "post-only limit order would cross the book".into(),
+                        ),
+                    ),
+                    None,
+                );
+            }
             let Some((filled, price)) = fill else {
                 if matches!(
                     request.state.time_in_force,
@@ -645,6 +801,40 @@ impl MockExchange {
             );
         }
 
+        let remaining = requested_quantity - quantity;
+        let should_rest = request.state.kind == OrderKind::Limit
+            && remaining > Decimal::ZERO
+            && matches!(
+                request.state.time_in_force,
+                TimeInForce::GoodUntilCancelled { .. } | TimeInForce::GoodUntilEndOfDay
+            );
+        if should_rest {
+            let reserve_amount = match request.state.side {
+                Side::Buy => remaining * request.state.price * (Decimal::ONE + self.fees_percent),
+                Side::Sell => remaining,
+            };
+            let available_after_fill = self
+                .account
+                .balance(&debit_asset)
+                .map(|balance| balance.balance.free)
+                .unwrap_or_default();
+            if available_after_fill < debit_amount + reserve_amount {
+                return (
+                    build_open_order_err_response(
+                        request,
+                        ApiError::BalanceInsufficient(
+                            debit_asset,
+                            format!(
+                                "Available Balance: {}, Required Balance: {}",
+                                available_after_fill, reserve_amount
+                            ),
+                        ),
+                    ),
+                    None,
+                );
+            }
+        }
+
         let balance_snapshots = match self.account.apply_fill_balances(
             &debit_asset,
             debit_amount,
@@ -659,6 +849,32 @@ impl MockExchange {
 
         let order_id = self.order_id_sequence_fetch_add();
         let trade_id = TradeId(order_id.0.clone());
+
+        if should_rest {
+            let reserve_amount = match request.state.side {
+                Side::Buy => remaining * request.state.price * (Decimal::ONE + self.fees_percent),
+                Side::Sell => remaining,
+            };
+            let _ = self.account.reserve_balance(
+                &request.key.cid,
+                &debit_asset,
+                reserve_amount,
+                time_exchange,
+            );
+            self.account.insert_open_order(Order {
+                key: request.key.clone(),
+                side: request.state.side,
+                price: request.state.price,
+                quantity: request.state.quantity,
+                kind: request.state.kind,
+                time_in_force: request.state.time_in_force,
+                state: Open {
+                    id: order_id.clone(),
+                    time_exchange,
+                    filled_quantity: quantity,
+                },
+            });
+        }
 
         let order_response = Order {
             key: request.key.clone(),
@@ -825,6 +1041,56 @@ mod tests {
                 time_in_force: TimeInForce::ImmediateOrCancel,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn conservative_queue_fills_only_on_public_trade() {
+        let mut exchange = exchange();
+        exchange.queue_model = Arc::new(ConservativeQueue);
+        let mut resting = request(Side::Buy, 1, 8);
+        resting.state.kind = OrderKind::Limit;
+        resting.state.time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
+        let (response, _) = exchange.open_order(resting);
+        assert!(response.state.is_ok());
+        exchange.apply_market_event(MockMarketEvent {
+            instrument: InstrumentNameExchange::from("BTCUSDT"),
+            time_exchange: DateTime::<Utc>::UNIX_EPOCH,
+            kind: MockMarketEventKind::OrderBook {
+                bids: vec![],
+                asks: vec![MockMarketLevel {
+                    price: Decimal::from(8),
+                    quantity: Decimal::from(1),
+                }],
+            },
+        });
+        assert_eq!(
+            exchange
+                .account
+                .orders_open()
+                .next()
+                .unwrap()
+                .state
+                .filled_quantity,
+            Decimal::ZERO
+        );
+        exchange.apply_market_event(MockMarketEvent {
+            instrument: InstrumentNameExchange::from("BTCUSDT"),
+            time_exchange: DateTime::<Utc>::UNIX_EPOCH,
+            kind: MockMarketEventKind::Trade {
+                price: Decimal::from(8),
+                quantity: Decimal::from(1),
+            },
+        });
+        assert_eq!(
+            exchange
+                .account
+                .orders_open()
+                .next()
+                .unwrap()
+                .state
+                .filled_quantity,
+            Decimal::ONE
+        );
     }
 
     #[tokio::test]
@@ -1123,6 +1389,19 @@ mod tests {
     fn open_order_updates_both_assets_for_buy_and_sell() {
         let mut exchange = exchange();
         exchange.fees_percent = Decimal::new(1, 2);
+        exchange.market_books.insert(
+            InstrumentNameExchange::from("BTCUSDT"),
+            MockOrderBook {
+                asks: vec![MockMarketLevel {
+                    price: Decimal::from(10),
+                    quantity: Decimal::from(10),
+                }],
+                bids: vec![MockMarketLevel {
+                    price: Decimal::from(10),
+                    quantity: Decimal::from(10),
+                }],
+            },
+        );
         let (buy, notifications) = exchange.open_order(request(Side::Buy, 2, 10));
         assert!(buy.state.is_ok());
         let notifications = notifications.expect("accepted fill emits notifications");
