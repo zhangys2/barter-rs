@@ -1,0 +1,13 @@
+# Windows MSVC linking workaround.
+#
+# With the default multiple codegen units, rustc emits rlib archive members with
+# long names that link.exe and lld-link fail to resolve: every integration test
+# and example dies with hundreds of bogus "unresolved external symbol" errors
+# (core::cmp::PartialEq::ne, tracing_core::field::Value::record, …), and lld
+# reports the same archives as "truncated or malformed ... string table at long
+# name offset not terminated". One codegen unit avoids the long-name members.
+#
+# Scoped to the MSVC target, so Linux and CI builds are unaffected. Do not remove
+# without checking `cargo test --workspace --no-run` on Windows first.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ccodegen-units=1"]
