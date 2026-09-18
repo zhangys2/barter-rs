@@ -212,6 +212,9 @@ impl AccountState {
         if id.is_some_and(|id| id != &order.state.id) {
             return Err(ApiError::OrderRejected(format!("order {cid} id does not match")).into());
         }
+        if order.state.filled_quantity.abs() >= order.quantity.abs() {
+            return Err(ApiError::OrderAlreadyFullyFilled.into());
+        }
 
         let Some(order) = self.orders_open.remove(cid) else {
             return Err(
@@ -493,6 +496,43 @@ mod tests {
             inactive,
             UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
         ));
+    }
+
+    #[test]
+    fn cancel_fully_filled_order_returns_typed_error() {
+        let mut account = account_with_balances();
+        let cid = ClientOrderId::new("filled");
+        let order_id = OrderId::new("exchange-filled");
+        account.orders_open.insert(
+            cid.clone(),
+            Order {
+                key: OrderKey {
+                    exchange: ExchangeId::Mock,
+                    instrument: InstrumentNameExchange::from("BTCUSDT"),
+                    strategy: StrategyId::new("strategy-1"),
+                    cid: cid.clone(),
+                },
+                side: Side::Buy,
+                price: rust_decimal::Decimal::new(10, 0),
+                quantity: rust_decimal::Decimal::new(1, 0),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state: Open {
+                    id: order_id.clone(),
+                    time_exchange: Utc.timestamp_opt(0, 0).unwrap(),
+                    filled_quantity: rust_decimal::Decimal::new(1, 0),
+                },
+            },
+        );
+
+        let error = account
+            .cancel_order(&cid, Some(&order_id), Utc.timestamp_opt(1, 0).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            UnindexedOrderError::Rejected(ApiError::OrderAlreadyFullyFilled)
+        ));
+        assert!(account.orders_open.contains_key(&cid));
     }
 }
 
