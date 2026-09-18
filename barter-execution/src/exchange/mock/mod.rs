@@ -446,10 +446,6 @@ impl MockExchange {
             request.state.id.as_ref(),
             self.time_exchange(),
         );
-        if state.is_ok() {
-            self.account
-                .release_reservation(&request.key.cid, self.time_exchange());
-        }
         OrderEvent { key, state }
     }
 
