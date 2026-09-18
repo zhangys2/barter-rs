@@ -443,7 +443,7 @@ impl MockExchange {
     }
 
     fn update_time_exchange(&mut self, time_request: DateTime<Utc>) {
-        let client_to_exchange_latency = self.effective_latency_ms() / 2;
+        let client_to_exchange_latency = self.effective_order_latency_ms();
 
         self.time_exchange_latest = time_request
             .checked_add_signed(TimeDelta::milliseconds(client_to_exchange_latency as i64))
@@ -1252,7 +1252,7 @@ mod tests {
         assert!(response.state.is_err());
         assert_eq!(exchange.account.orders_open().count(), 0);
 
-        let mut crossing = request(Side::Buy, 1, 7);
+        let mut crossing = request(Side::Buy, 2, 7);
         crossing.state.kind = OrderKind::Limit;
         crossing.state.time_in_force = TimeInForce::ImmediateOrCancel;
         let (response, notifications) = exchange.open_order(crossing);
@@ -1261,7 +1261,14 @@ mod tests {
             Decimal::from(1)
         );
         assert_eq!(response.price, Decimal::from(7));
-        assert!(notifications.is_some());
+        let notifications = notifications.expect("IOC partial fill emits notifications");
+        let order = notifications.order.expect("IOC emits an order snapshot");
+        assert!(matches!(
+            order.0.state,
+            OrderState::Inactive(InactiveOrderState::Expired)
+        ));
+        assert!(exchange.account.reservation(&response.key.cid).is_none());
+        assert_eq!(exchange.account.orders_open().count(), 0);
     }
 
     #[test]
