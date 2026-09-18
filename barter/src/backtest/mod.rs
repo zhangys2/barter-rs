@@ -41,6 +41,17 @@ use futures::{SinkExt, StreamExt, future::try_join_all};
 use rust_decimal::{Decimal, prelude::FromPrimitive};
 use smol_str::SmolStr;
 use std::{fmt::Debug, sync::Arc};
+
+fn accept_market_timestamp(
+    last: &mut Option<chrono::DateTime<chrono::Utc>>,
+    current: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if last.is_some_and(|previous| current < previous) {
+        return false;
+    }
+    *last = Some(current);
+    true
+}
 use tokio::sync::oneshot;
 
 /// Defines the interface and implementations for different types of market data sources
@@ -295,40 +306,53 @@ where
     // the bounded send preserves event ordering and prevents a burst from silently dropping the
     // book update that determines a corresponding fill.
     let instruments = args_constant.instruments.clone();
-    let market_stream = market_stream.then(move |event| {
-        let mock_event = if let barter_data::streams::reconnect::Event::Item(market_event) = &event
-        {
-            let sender = mock_market_txs.get(&market_event.exchange).cloned();
-            let instrument = instruments
-                .instruments()
-                .get(market_event.instrument.index())
-                .map(|instrument| instrument.value.name_exchange.clone());
-            sender.zip(instrument).and_then(|(sender, instrument)| {
-                market_event.kind.into_mock_market_kind().map(|kind| {
-                    (sender, {
-                        let (applied_tx, applied_rx) = oneshot::channel();
-                        (
-                            MockMarketEvent {
-                                instrument,
-                                time_exchange: market_event.time_exchange,
-                                kind,
-                                applied: Some(applied_tx),
-                            },
-                            applied_rx,
-                        )
+    let mut latest_exchange_time = None;
+    let market_stream = market_stream.filter_map(move |event| {
+        let in_order = match &event {
+            barter_data::streams::reconnect::Event::Item(market_event) => {
+                accept_market_timestamp(&mut latest_exchange_time, market_event.time_exchange)
+            }
+            barter_data::streams::reconnect::Event::Reconnecting(_) => true,
+        };
+        let mock_event = if in_order {
+            if let barter_data::streams::reconnect::Event::Item(market_event) = &event {
+                let sender = mock_market_txs.get(&market_event.exchange).cloned();
+                let instrument = instruments
+                    .instruments()
+                    .get(market_event.instrument.index())
+                    .map(|instrument| instrument.value.name_exchange.clone());
+                sender.zip(instrument).and_then(|(sender, instrument)| {
+                    market_event.kind.into_mock_market_kind().map(|kind| {
+                        (sender, {
+                            let (applied_tx, applied_rx) = oneshot::channel();
+                            (
+                                MockMarketEvent {
+                                    instrument,
+                                    time_exchange: market_event.time_exchange,
+                                    kind,
+                                    applied: Some(applied_tx),
+                                },
+                                applied_rx,
+                            )
+                        })
                     })
                 })
-            })
+            } else {
+                None
+            }
         } else {
             None
         };
         async move {
+            if !in_order {
+                return None;
+            }
             if let Some((mut sender, (mock_event, applied_rx))) = mock_event {
                 if sender.send(mock_event).await.is_ok() {
                     let _ = applied_rx.await;
                 }
             }
-            event
+            Some(event)
         }
     });
 
@@ -417,32 +441,6 @@ mod tests {
 
     #[test]
     fn identical_ordered_market_inputs_have_byte_identical_event_streams() {
-        let inputs = vec![
-            DataKind::OrderBookL1(barter_data::subscription::book::OrderBookL1 {
-                last_update_time: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
-                best_bid: Some(Level {
-                    price: dec!(10),
-                    amount: dec!(2),
-                }),
-                best_ask: Some(Level {
-                    price: dec!(11),
-                    amount: dec!(3),
-                }),
-            }),
-            DataKind::Trade(PublicTrade {
-                id: "trade-1".into(),
-                price: 10.5,
-                amount: 2.0,
-                side: barter_instrument::Side::Buy,
-            }),
-            DataKind::OrderBook(OrderBookEvent::Snapshot(OrderBook::new(
-                7,
-                None,
-                [(dec!(10), dec!(2)), (dec!(9), dec!(1))],
-                [(dec!(11), dec!(3)), (dec!(12), dec!(4))],
-            ))),
-        ];
-
         fn encoded_stream(inputs: &[DataKind]) -> Vec<u8> {
             let events = inputs
                 .iter()
@@ -460,10 +458,50 @@ mod tests {
             serde_json::to_vec(&events).unwrap()
         }
 
-        // The serialized stream represents every bridge output in input order, not just one
-        // event serialized twice. Identical Back-Test input must therefore produce identical
-        // bytes before it is delivered to the deterministic Mock Exchange.
-        assert_eq!(encoded_stream(&inputs), encoded_stream(&inputs));
+        fn build_inputs() -> Vec<DataKind> {
+            vec![
+                DataKind::OrderBookL1(barter_data::subscription::book::OrderBookL1 {
+                    last_update_time: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                    best_bid: Some(Level {
+                        price: dec!(10),
+                        amount: dec!(2),
+                    }),
+                    best_ask: Some(Level {
+                        price: dec!(11),
+                        amount: dec!(3),
+                    }),
+                }),
+                DataKind::Trade(PublicTrade {
+                    id: "trade-1".into(),
+                    price: 10.5,
+                    amount: 2.0,
+                    side: barter_instrument::Side::Buy,
+                }),
+                DataKind::OrderBook(OrderBookEvent::Snapshot(OrderBook::new(
+                    7,
+                    None,
+                    [(dec!(10), dec!(2)), (dec!(9), dec!(1))],
+                    [(dec!(11), dec!(3)), (dec!(12), dec!(4))],
+                ))),
+            ]
+        }
+
+        // The public backtest result includes runtime-dependent timing fields, so compare the
+        // complete deterministic bridge event streams from two independently built inputs.
+        assert_eq!(
+            encoded_stream(&build_inputs()),
+            encoded_stream(&build_inputs())
+        );
+
+        let mut last = None;
+        assert!(accept_market_timestamp(
+            &mut last,
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+        ));
+        assert!(!accept_market_timestamp(
+            &mut last,
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH - chrono::TimeDelta::seconds(1),
+        ));
     }
 
     #[test]

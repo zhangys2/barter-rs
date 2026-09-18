@@ -1175,6 +1175,61 @@ mod tests {
         assert_eq!(exchange.account.orders_open().count(), 0);
     }
 
+    #[test]
+    fn market_buy_walks_two_ask_levels_at_vwap_and_updates_both_assets() {
+        let mut exchange = exchange();
+        exchange.market_books.insert(
+            InstrumentNameExchange::from("BTCUSDT"),
+            MockOrderBook {
+                asks: vec![
+                    MockMarketLevel {
+                        price: Decimal::from(10),
+                        quantity: Decimal::from(2),
+                    },
+                    MockMarketLevel {
+                        price: Decimal::from(12),
+                        quantity: Decimal::from(3),
+                    },
+                ],
+                bids: vec![],
+            },
+        );
+
+        let mut order = request(Side::Buy, 4, 12);
+        order.state.kind = OrderKind::Market;
+        let (response, notifications) = exchange.open_order(order);
+        assert_eq!(response.state.unwrap().filled_quantity, Decimal::from(4));
+        assert_eq!(response.price, Decimal::from(11));
+        let notifications = notifications.expect("market fill emits notifications");
+        assert_eq!(notifications.balances.len(), 2);
+        assert_eq!(
+            notifications.trade.as_ref().unwrap().quantity,
+            Decimal::from(4)
+        );
+        assert_eq!(
+            notifications.trade.as_ref().unwrap().price,
+            Decimal::from(11)
+        );
+        assert_eq!(
+            exchange
+                .account
+                .balance(&AssetNameExchange::from("BTC"))
+                .unwrap()
+                .balance
+                .free,
+            Decimal::from(104)
+        );
+        assert_eq!(
+            exchange
+                .account
+                .balance(&AssetNameExchange::from("USDT"))
+                .unwrap()
+                .balance
+                .free,
+            Decimal::from(9_956)
+        );
+    }
+
     #[tokio::test]
     async fn limit_orders_rest_or_fill_against_l2_and_ioc_does_not_rest() {
         let mut exchange = exchange();
