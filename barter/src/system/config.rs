@@ -58,11 +58,12 @@ pub struct InstrumentConfig {
 /// Configuration for an execution link.
 ///
 /// Represents different types of execution configurations,
-/// currently supporting mock execution for backtesting and paper-trading.
+/// Supports mock execution for backtesting and paper-trading, and Binance Spot
+/// execution for live-trading.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, From)]
 #[serde(untagged)]
 pub enum ExecutionConfig {
-    /// Mock execution configuration for backtesting and paper-trading
+    /// Mock execution configuration for backtesting and paper-trading.
     Mock(MockExecutionConfig),
     /// Binance Spot live execution; credential values are referenced by environment variable name.
     BinanceSpot(BinanceSpotConfig),

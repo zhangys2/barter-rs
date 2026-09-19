@@ -299,6 +299,7 @@ impl AccountState {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::{
@@ -493,8 +494,8 @@ mod tests {
             .cancel_order(&cid, Some(&order_id), Utc.timestamp_opt(1, 0).unwrap())
             .unwrap();
         assert_eq!(cancelled.id, order_id);
-        assert!(account.orders_open.get(&cid).is_none());
-        assert!(account.orders_cancelled.get(&cid).is_some());
+        assert!(!account.orders_open.contains_key(&cid));
+        assert!(account.orders_cancelled.contains_key(&cid));
 
         let inactive = account
             .cancel_order(&cid, Some(&order_id), Utc.timestamp_opt(2, 0).unwrap())

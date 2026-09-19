@@ -113,9 +113,13 @@ use barter_integration::{
 use futures::{SinkExt, Stream, StreamExt};
 
 use barter_integration::stream::ExchangeStream;
+#[cfg(test)]
+use criterion as _;
 use std::{collections::VecDeque, future::Future};
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
+#[cfg(test)]
+use tracing_subscriber as _;
 
 /// All [`Error`](std::error::Error)s generated in Barter-Data.
 pub mod error;

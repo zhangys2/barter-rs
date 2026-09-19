@@ -34,7 +34,7 @@ pub mod manager;
 /// 1. OpenInFlight - Initial order request sent to exchange
 /// 2. Open - Order confirmed as open on exchange
 /// 3. CancelInFlight - Cancellation request sent to exchange
-/// 4. Cancelled/Expired/FullyFilled/Open Failed - Terminal states, once achieved order is no longer tracked.
+/// 4. Cancelled/Expired/FullyFilled/Open Failed - Terminal states, once achieved an order is no longer tracked.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Constructor)]
 pub struct Orders<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex>(
     pub FnvHashMap<ClientOrderId, Order<ExchangeKey, InstrumentKey, ActiveOrderState>>,

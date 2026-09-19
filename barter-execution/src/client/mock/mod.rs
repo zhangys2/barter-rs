@@ -25,14 +25,43 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::error;
 
-#[derive(
-    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
-)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct MockExecutionConfig {
     pub mocked_exchange: ExchangeId,
     pub initial_state: UnindexedAccountSnapshot,
+    /// Legacy single latency value used when the explicit values are omitted.
     pub latency_ms: u64,
     pub fees_percent: Decimal,
+    /// Feed delay, independently configurable from order-request delay.
+    #[serde(default)]
+    pub feed_latency_ms: Option<u64>,
+    /// Order-request and account-response delay.
+    #[serde(default)]
+    pub order_latency_ms: Option<u64>,
+}
+
+impl MockExecutionConfig {
+    pub fn new(
+        mocked_exchange: ExchangeId,
+        initial_state: UnindexedAccountSnapshot,
+        latency_ms: u64,
+        fees_percent: Decimal,
+    ) -> Self {
+        Self {
+            mocked_exchange,
+            initial_state,
+            latency_ms,
+            fees_percent,
+            feed_latency_ms: None,
+            order_latency_ms: None,
+        }
+    }
+
+    pub fn with_latencies(mut self, feed_latency_ms: u64, order_latency_ms: u64) -> Self {
+        self.feed_latency_ms = Some(feed_latency_ms);
+        self.order_latency_ms = Some(order_latency_ms);
+        self
+    }
 }
 
 #[derive(Debug, Constructor)]

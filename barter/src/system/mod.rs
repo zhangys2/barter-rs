@@ -16,7 +16,7 @@ use crate::{
 };
 use barter_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
 use barter_integration::{
-    channel::{BoundedTx, LatencySamples, UnboundedRx},
+    channel::{BoundedTx, UnboundedRx},
     collection::{one_or_many::OneOrMany, snapshot::SnapUpdates},
 };
 use futures::SinkExt;
@@ -27,11 +27,16 @@ use std::{
 };
 use tokio::task::{JoinError, JoinHandle};
 
+pub use barter_integration::channel::{LatencyHop, MarketLatency};
+
 /// Provides a `SystemBuilder` for constructing a Barter trading system, and associated types.
 pub mod builder;
 
 /// Provides a convenient `SystemConfig` used for defining a Barter trading system.
 pub mod config;
+
+/// Market-feed observation keys used by keyed conflation on the market path.
+pub mod observation;
 
 /// Initialised and running Barter trading system.
 ///
@@ -57,8 +62,8 @@ where
     pub audit:
         Option<SnapUpdates<AuditTick<Engine::Snapshot>, UnboundedRx<AuditTick<Engine::Audit>>>>,
 
-    /// Runtime market-feed transport latency samples.
-    pub market_latency: Arc<Mutex<LatencySamples>>,
+    /// Runtime market-feed latency samples for exchange, receive, and process hops.
+    pub market_latency: Arc<Mutex<MarketLatency>>,
 }
 
 impl<Engine, Event> System<Engine, Event>
@@ -66,9 +71,12 @@ where
     Engine: Processor<Event> + Auditor<Engine::Audit, Context = EngineContext>,
     Event: Debug + Clone + Send,
 {
-    /// Return a runtime transport latency percentile for the market feed.
-    pub fn market_latency_percentile(&self, percentile: f64) -> Option<Duration> {
-        self.market_latency.lock().ok()?.percentile(percentile)
+    /// Return a runtime latency percentile for one hop on the market path.
+    ///
+    /// Hops are exchange timestamp -> received time, received time -> Engine feed,
+    /// and Engine process duration.
+    pub fn market_latency_percentile(&self, hop: LatencyHop, percentile: f64) -> Option<Duration> {
+        self.market_latency.lock().ok()?.percentile(hop, percentile)
     }
 
     /// Shutdown the `System` gracefully.

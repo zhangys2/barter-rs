@@ -161,6 +161,9 @@ pub enum Health {
     Healthy,
 
     /// Connection is currently attempting to re-establish after a disconnect or failure.
+    ///
+    /// Also the default for a connection that has never been established. A distinct
+    /// never-connected state is not modelled: consumers treat both cases as not yet Healthy.
     #[default]
     Reconnecting,
 }
@@ -222,6 +225,11 @@ mod tests {
     #[test]
     fn account_reconnect_and_recovery_update_global_health() {
         let mut states = one_exchange();
+        states
+            .exchanges
+            .get_mut(&ExchangeId::Mock)
+            .unwrap()
+            .market_data = Health::Healthy;
         states.exchanges.get_mut(&ExchangeId::Mock).unwrap().account = Health::Healthy;
         states.global = Health::Healthy;
         states.update_from_account_reconnecting(&ExchangeId::Mock);

@@ -12,7 +12,7 @@ fn channel_benchmarks(c: &mut Criterion) {
                 b.iter(|| {
                     let (tx, mut rx) = mpsc_bounded(burst.max(1), OverflowPolicy::DropOldest);
                     for value in 0..burst {
-                        black_box(tx.try_send(value).unwrap());
+                        tx.try_send(value).unwrap();
                     }
                     let mut consumed = 0;
                     while let Some(value) = rx.try_recv() {

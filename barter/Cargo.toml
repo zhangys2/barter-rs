@@ -16,6 +16,11 @@ name = "backtest"
 path = "benches/backtest/mod.rs"
 harness = false
 
+[[bench]]
+name = "engine_process"
+path = "benches/engine_process.rs"
+harness = false
+
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
 serde_json = { workspace = true }
@@ -58,4 +63,3 @@ derive_more = { workspace = true, features = ["constructor", "from", "display"]}
 prettytable-rs = "0.10.0"
 itertools = { workspace = true }
 parking_lot = { workspace = true }
-

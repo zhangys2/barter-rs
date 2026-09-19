@@ -14,6 +14,11 @@ categories = ["accessibility", "simulation"]
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 rust_decimal_macros = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hot_path"
+harness = false
 
 [dependencies]
 # Barter Ecosystem

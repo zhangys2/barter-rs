@@ -572,20 +572,20 @@ mod tests {
             second_price in 1u32..10_000,
         ) {
             let time = DateTime::<Utc>::MIN_UTC;
-            let first_quantity = first_quantity as f64;
-            let second_quantity = second_quantity as f64;
-            let first_price = first_price as f64;
-            let second_price = second_price as f64;
-            let initial = Position::from(&trade(time, Side::Buy, first_price, first_quantity, 0.0));
+            let first_quantity = Decimal::from(first_quantity);
+            let second_quantity = Decimal::from(second_quantity);
+            let first_price = Decimal::from(first_price);
+            let second_price = Decimal::from(second_price);
+            let initial = Position::from(&trade(time, Side::Buy, first_price.to_string().parse().unwrap(), first_quantity.to_string().parse().unwrap(), 0.0));
             let (updated, exited) = initial.update_from_trade(&trade(
-                time_plus_days(time, 1), Side::Buy, second_price, second_quantity, 0.0,
+                time_plus_days(time, 1), Side::Buy, second_price.to_string().parse().unwrap(), second_quantity.to_string().parse().unwrap(), 0.0,
             ));
             let updated = updated.unwrap();
             prop_assert!(exited.is_none());
-            prop_assert_eq!(updated.quantity_abs, Decimal::from_f64_retain(first_quantity + second_quantity).unwrap());
+            prop_assert_eq!(updated.quantity_abs, first_quantity + second_quantity);
             let expected = (first_price * first_quantity + second_price * second_quantity)
                 / (first_quantity + second_quantity);
-            prop_assert_eq!(updated.price_entry_average, Decimal::from_f64_retain(expected).unwrap());
+            prop_assert_eq!(updated.price_entry_average, expected);
         }
     }
 
@@ -596,19 +596,21 @@ mod tests {
             close_quantity in 1u32..100,
         ) {
             let time = DateTime::<Utc>::MIN_UTC;
-            let open_quantity = open_quantity as f64;
-            let close_quantity = close_quantity as f64;
-            let initial = Position::from(&trade(time, Side::Buy, 100.0, open_quantity, 0.0));
+            let open_quantity = Decimal::from(open_quantity);
+            let close_quantity = Decimal::from(close_quantity);
+            let initial = Position::from(&trade(time, Side::Buy, 100.0, open_quantity.to_string().parse().unwrap(), 0.0));
             let (updated, exited) = initial.update_from_trade(&trade(
-                time_plus_days(time, 1), Side::Sell, 100.0, close_quantity, 0.0,
+                time_plus_days(time, 1), Side::Sell, 100.0, close_quantity.to_string().parse().unwrap(), 0.0,
             ));
-            prop_assert!(exited.is_some());
             if close_quantity < open_quantity {
-                prop_assert_eq!(updated.unwrap().quantity_abs, Decimal::from_f64_retain(open_quantity - close_quantity).unwrap());
+                prop_assert!(exited.is_none());
+                prop_assert_eq!(updated.unwrap().quantity_abs, open_quantity - close_quantity);
             } else if close_quantity == open_quantity {
+                prop_assert!(exited.is_some());
                 prop_assert!(updated.is_none());
             } else {
-                prop_assert_eq!(updated.unwrap().quantity_abs, Decimal::from_f64_retain(close_quantity - open_quantity).unwrap());
+                prop_assert!(exited.is_some());
+                prop_assert_eq!(updated.unwrap().quantity_abs, close_quantity - open_quantity);
             }
         }
     }
@@ -1216,10 +1218,10 @@ mod tests {
         for (index, test) in cases.into_iter().enumerate() {
             let actual = calculate_pnl_realised(
                 test.side,
-                test.price_entry_average.into(),
-                test.closed_quantity.into(),
-                test.closed_price.into(),
-                test.closed_fee.into(),
+                test.price_entry_average,
+                test.closed_quantity,
+                test.closed_price,
+                test.closed_fee,
             );
 
             assert_eq!(actual, test.expected, "TC{} failed", index);
@@ -1268,9 +1270,9 @@ mod tests {
 
         for (index, test) in cases.into_iter().enumerate() {
             let actual = calculate_pnl_return(
-                test.pnl_realised.into(),
-                test.price_entry_average.into(),
-                test.quantity_abs_max.into(),
+                test.pnl_realised,
+                test.price_entry_average,
+                test.quantity_abs_max,
             );
 
             assert_eq!(actual, test.expected, "TC{} failed", index);

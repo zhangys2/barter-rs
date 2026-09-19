@@ -187,7 +187,9 @@ pub enum OverflowPolicy {
     Block,
     /// Evict the oldest queued item before enqueueing the new item.
     DropOldest,
-    /// Keep only the newest queued item when the queue is full.
+    /// Keep the newest observation. When a key function is provided via
+    /// [`mpsc_bounded_keyed`], this is latest-per-key (instrument + data kind);
+    /// otherwise the channel keeps only the newest queued item.
     Conflate,
 }
 
@@ -212,15 +214,25 @@ struct BoundedState<T> {
     senders: usize,
 }
 
+/// Identifies one latest observation on a conflating market feed.
+///
+/// Used by [`OverflowPolicy::Conflate`] with [`mpsc_bounded_keyed`] to keep the newest
+/// item per instrument and data kind rather than a single global latest item.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct ObservationKey {
+    pub instrument: u64,
+    pub kind: u8,
+}
+
 /// A small bounded adapter with explicit overflow semantics.
 ///
-/// `Conflate` is intentionally generic: it keeps the latest event, but does not claim
-/// instrument-aware conflation. Callers that need per-instrument conflation must key events
-/// before using this adapter.
+/// Unkeyed `Conflate` keeps the latest event. Keyed `Conflate` (see [`mpsc_bounded_keyed`])
+/// keeps the latest event per [`ObservationKey`].
 pub struct BoundedTx<T> {
     state: Arc<Mutex<BoundedState<T>>>,
     capacity: usize,
     policy: OverflowPolicy,
+    key_of: fn(&T) -> Option<ObservationKey>,
 }
 
 #[derive(Debug)]
@@ -255,9 +267,21 @@ pub fn mpsc_bounded<T>(capacity: usize, policy: OverflowPolicy) -> (BoundedTx<T>
             state: Arc::clone(&state),
             capacity,
             policy,
+            key_of: |_| None,
         },
         BoundedRx { state },
     )
+}
+
+/// Bounded channel whose [`OverflowPolicy::Conflate`] path keeps the latest item per key.
+pub fn mpsc_bounded_keyed<T>(
+    capacity: usize,
+    policy: OverflowPolicy,
+    key_of: fn(&T) -> Option<ObservationKey>,
+) -> (BoundedTx<T>, BoundedRx<T>) {
+    let (mut tx, rx) = mpsc_bounded(capacity, policy);
+    tx.key_of = key_of;
+    (tx, rx)
 }
 
 impl<T> Clone for BoundedTx<T> {
@@ -269,6 +293,7 @@ impl<T> Clone for BoundedTx<T> {
             state: Arc::clone(&self.state),
             capacity: self.capacity,
             policy: self.policy,
+            key_of: self.key_of,
         }
     }
 }
@@ -295,7 +320,7 @@ impl<T> Debug for BoundedTx<T> {
         f.debug_struct("BoundedTx")
             .field("capacity", &self.capacity)
             .field("policy", &self.policy)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -317,16 +342,27 @@ impl<T> BoundedTx<T> {
         if state.closed {
             return Err(BoundedSendError::Closed(item));
         }
-        if state.queue.len() >= self.capacity {
-            match self.policy {
-                OverflowPolicy::Block => return Err(BoundedSendError::Full(item)),
-                OverflowPolicy::DropOldest => {
-                    state.queue.pop_front();
-                }
-                OverflowPolicy::Conflate => {
+        match self.policy {
+            OverflowPolicy::Block if state.queue.len() >= self.capacity => {
+                return Err(BoundedSendError::Full(item));
+            }
+            OverflowPolicy::DropOldest if state.queue.len() >= self.capacity => {
+                state.queue.pop_front();
+            }
+            OverflowPolicy::Conflate => {
+                if let Some(key) = (self.key_of)(&item) {
+                    state
+                        .queue
+                        .retain(|queued| (self.key_of)(queued) != Some(key));
+                    if state.queue.len() >= self.capacity {
+                        state.queue.pop_front();
+                    }
+                } else {
+                    // Unkeyed conflation is a single latest observation.
                     state.queue.clear();
                 }
             }
+            _ => {}
         }
         state.queue.push_back(item);
         if let Some(waker) = state.waker.take() {
@@ -372,12 +408,45 @@ pub struct LatencySamples {
 
 const LATENCY_SAMPLE_CAPACITY: usize = 4096;
 
+/// Named hop on the Market Stream to Engine path (W5.4).
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum LatencyHop {
+    /// Exchange timestamp -> local receive timestamp.
+    ExchangeToReceived,
+    /// Local receive -> Engine feed enqueue.
+    ReceivedToEngine,
+    /// Time spent in Engine process.
+    EngineProcess,
+}
+
+/// Percentile-exportable latency samples for the three W5.4 hops.
+#[derive(Debug, Default, Clone)]
+pub struct MarketLatency {
+    pub exchange_to_received: LatencySamples,
+    pub received_to_engine: LatencySamples,
+    pub engine_process: LatencySamples,
+}
+
+impl MarketLatency {
+    pub fn percentile(&self, hop: LatencyHop, percentile: f64) -> Option<Duration> {
+        match hop {
+            LatencyHop::ExchangeToReceived => self.exchange_to_received.percentile(percentile),
+            LatencyHop::ReceivedToEngine => self.received_to_engine.percentile(percentile),
+            LatencyHop::EngineProcess => self.engine_process.percentile(percentile),
+        }
+    }
+}
+
 impl LatencySamples {
     pub fn record(&mut self, started: Instant) {
+        self.record_duration(started.elapsed());
+    }
+
+    pub fn record_duration(&mut self, duration: Duration) {
         if self.samples.len() == LATENCY_SAMPLE_CAPACITY {
             self.samples.pop_front();
         }
-        self.samples.push_back(started.elapsed());
+        self.samples.push_back(duration);
     }
 
     pub fn percentile(&self, percentile: f64) -> Option<Duration> {
@@ -492,19 +561,29 @@ mod bounded_tests {
     }
 
     #[test]
-    fn synthetic_burst_never_exceeds_capacity_and_percentiles_are_available() {
-        let (tx, mut rx) = mpsc_bounded(4, OverflowPolicy::DropOldest);
+    fn synthetic_10x_burst_never_exceeds_capacity_and_percentiles_are_available() {
+        // Documented synthetic 10x burst: 100 sends into a capacity-10 DropOldest queue.
+        let (tx, mut rx) = mpsc_bounded(10, OverflowPolicy::DropOldest);
         for value in 0..100 {
             tx.try_send(value).unwrap();
         }
-        assert_eq!(tx.len(), 4);
-        assert_eq!(rx.try_recv(), Some(96));
+        assert_eq!(tx.len(), 10);
+        assert_eq!(rx.try_recv(), Some(90));
 
-        let mut samples = LatencySamples::default();
-        samples.record(Instant::now());
-        assert_eq!(samples.len(), 1);
-        assert!(samples.percentile(0.50).is_some());
-        assert!(samples.percentile(0.95).is_some());
+        let mut hops = MarketLatency::default();
+        hops.exchange_to_received
+            .record_duration(Duration::from_millis(2));
+        hops.received_to_engine.record(Instant::now());
+        hops.engine_process.record(Instant::now());
+        assert!(
+            hops.percentile(LatencyHop::ExchangeToReceived, 0.50)
+                .is_some()
+        );
+        assert!(
+            hops.percentile(LatencyHop::ReceivedToEngine, 0.95)
+                .is_some()
+        );
+        assert!(hops.percentile(LatencyHop::EngineProcess, 0.99).is_some());
     }
 
     #[test]
@@ -530,11 +609,71 @@ mod bounded_tests {
     }
 
     #[tokio::test]
+    async fn conflate_replaces_stale_item_before_capacity_is_reached() {
+        let (tx, mut rx) = mpsc_bounded(4, OverflowPolicy::Conflate);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        assert_eq!(StreamExt::next(&mut rx).await, Some(2));
+    }
+
+    #[tokio::test]
     async fn conflate_keeps_only_latest_item() {
         let (tx, mut rx) = mpsc_bounded(2, OverflowPolicy::Conflate);
         tx.try_send(1).unwrap();
         tx.try_send(2).unwrap();
         tx.try_send(3).unwrap();
         assert_eq!(StreamExt::next(&mut rx).await, Some(3));
+    }
+
+    #[derive(Debug, Clone)]
+    struct KeyedItem {
+        key: ObservationKey,
+        value: u64,
+    }
+
+    fn keyed_item_key(item: &KeyedItem) -> Option<ObservationKey> {
+        Some(item.key)
+    }
+
+    #[tokio::test]
+    async fn keyed_conflate_keeps_latest_per_instrument_and_kind() {
+        let (tx, mut rx) = mpsc_bounded_keyed(8, OverflowPolicy::Conflate, keyed_item_key);
+        let trade = ObservationKey {
+            instrument: 1,
+            kind: 0,
+        };
+        let book = ObservationKey {
+            instrument: 1,
+            kind: 2,
+        };
+        let other = ObservationKey {
+            instrument: 2,
+            kind: 0,
+        };
+        tx.try_send(KeyedItem {
+            key: trade,
+            value: 1,
+        })
+        .unwrap();
+        tx.try_send(KeyedItem {
+            key: book,
+            value: 2,
+        })
+        .unwrap();
+        tx.try_send(KeyedItem {
+            key: other,
+            value: 3,
+        })
+        .unwrap();
+        tx.try_send(KeyedItem {
+            key: trade,
+            value: 4,
+        })
+        .unwrap();
+        let mut seen = Vec::new();
+        while let Some(item) = rx.try_recv() {
+            seen.push((item.key, item.value));
+        }
+        assert_eq!(seen, vec![(book, 2), (other, 3), (trade, 4)]);
     }
 }

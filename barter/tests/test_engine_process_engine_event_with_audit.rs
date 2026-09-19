@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 use barter::{
     EngineEvent, Sequence, Timed,
     engine::{
@@ -831,7 +832,7 @@ fn build_engine(
 
     let clock = HistoricalClock::new(STARTING_TIMESTAMP);
 
-    let state = EngineState::builder(&instruments, DefaultGlobalData::default(), |_| {
+    let state = EngineState::builder(&instruments, DefaultGlobalData, |_| {
         DefaultInstrumentMarketData::default()
     })
     .time_engine_start(STARTING_TIMESTAMP)

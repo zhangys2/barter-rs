@@ -47,7 +47,10 @@ pub mod request;
 
 pub struct MockExchange {
     pub exchange: ExchangeId,
+    /// Legacy configured latency retained for diagnostics and compatibility.
     pub latency_ms: u64,
+    pub feed_latency_ms: u64,
+    pub order_latency_ms: u64,
     pub latency_model: Arc<dyn LatencyModel>,
     pub queue_model: Arc<dyn QueueModel>,
     pub fees_percent: Decimal,
@@ -68,6 +71,8 @@ impl fmt::Debug for MockExchange {
             .debug_struct("MockExchange")
             .field("exchange", &self.exchange)
             .field("latency_ms", &self.latency_ms)
+            .field("feed_latency_ms", &self.feed_latency_ms)
+            .field("order_latency_ms", &self.order_latency_ms)
             .field("fees_percent", &self.fees_percent)
             .field("order_sequence", &self.order_sequence)
             .field("time_exchange_latest", &self.time_exchange_latest)
@@ -124,12 +129,16 @@ impl MockExchange {
         queue_model: Arc<dyn QueueModel>,
     ) -> Self {
         let fees_percent = config.fees_percent;
+        let feed_latency_ms = config.feed_latency_ms.unwrap_or(config.latency_ms);
+        let order_latency_ms = config.order_latency_ms.unwrap_or(config.latency_ms);
         let mut account = AccountState::from(config.initial_state);
         account.restore_reservations(&instruments, fees_percent, DateTime::<Utc>::UNIX_EPOCH);
 
         Self {
             exchange: config.mocked_exchange,
             latency_ms: config.latency_ms,
+            feed_latency_ms,
+            order_latency_ms,
             latency_model,
             queue_model,
             fees_percent,
@@ -250,12 +259,13 @@ impl MockExchange {
         let Some(book) = self.market_books.get(instrument).cloned() else {
             return;
         };
-        let orders: Vec<_> = self
+        let mut orders: Vec<_> = self
             .account
             .orders_open()
             .filter(|order| &order.key.instrument == instrument)
             .cloned()
             .collect();
+        orders.sort_unstable_by_key(|order| order.key.cid.clone());
         for order in orders {
             let remaining = order.quantity.abs() - order.state.filled_quantity.abs();
             if remaining <= Decimal::ZERO {
@@ -285,12 +295,13 @@ impl MockExchange {
         trade_price: Decimal,
         trade_quantity: Decimal,
     ) {
-        let orders: Vec<_> = self
+        let mut orders: Vec<_> = self
             .account
             .orders_open()
             .filter(|order| &order.key.instrument == instrument)
             .cloned()
             .collect();
+        orders.sort_unstable_by_key(|order| order.key.cid.clone());
         let mut remaining_trade = trade_quantity;
         for order in orders {
             if remaining_trade <= Decimal::ZERO {
@@ -414,13 +425,12 @@ impl MockExchange {
                 return;
             }
         }
-        if let Some(balance) = self.account.balance(&debit_asset).cloned() {
-            if let Some(snapshot) = balances
+        if let Some(balance) = self.account.balance(&debit_asset).cloned()
+            && let Some(snapshot) = balances
                 .iter_mut()
                 .find(|snapshot| snapshot.asset == debit_asset)
-            {
-                *snapshot = balance;
-            }
+        {
+            *snapshot = balance;
         }
         let trade_id = self.order_id_sequence_fetch_add().0;
         let trade = Trade {
@@ -453,11 +463,11 @@ impl MockExchange {
     }
 
     fn effective_feed_latency_ms(&self) -> u64 {
-        self.latency_model.feed_delay_ms(self.latency_ms)
+        self.latency_model.feed_delay_ms(self.feed_latency_ms)
     }
 
     fn effective_order_latency_ms(&self) -> u64 {
-        self.latency_model.order_delay_ms(self.latency_ms)
+        self.latency_model.order_delay_ms(self.order_latency_ms)
     }
 
     fn effective_latency_ms(&self) -> u64 {
@@ -469,7 +479,12 @@ impl MockExchange {
     }
 
     pub fn account_snapshot(&self) -> UnindexedAccountSnapshot {
-        let balances = self.account.balances().cloned().collect();
+        let balances = self
+            .account
+            .balances()
+            .cloned()
+            .sorted_unstable_by_key(|balance| balance.asset.clone())
+            .collect();
 
         let orders_open = self
             .account
@@ -484,7 +499,8 @@ impl MockExchange {
             .map(UnindexedOrder::from);
 
         let orders_all = orders_open.chain(orders_cancelled);
-        let orders_all = orders_all.sorted_unstable_by_key(|order| order.key.instrument.clone());
+        let orders_all = orders_all
+            .sorted_unstable_by_key(|order| (order.key.instrument.clone(), order.key.cid.clone()));
         let orders_by_instrument = orders_all.chunk_by(|order| order.key.instrument.clone());
 
         let instruments = orders_by_instrument
@@ -562,23 +578,23 @@ impl MockExchange {
                 }
             }
 
-            if let Some(trade) = trade {
-                if tx.send(trade).is_err() {
-                    error!(
-                        %exchange,
-                        kind = "Trade<QuoteAsset, InstrumentNameExchange>",
-                        "MockExchange failed to send AccountEvent notification to client"
-                    );
-                }
+            if let Some(trade) = trade
+                && tx.send(trade).is_err()
+            {
+                error!(
+                    %exchange,
+                    kind = "Trade<QuoteAsset, InstrumentNameExchange>",
+                    "MockExchange failed to send AccountEvent notification to client"
+                );
             }
-            if let Some(order) = order {
-                if tx.send(order).is_err() {
-                    error!(
-                        %exchange,
-                        kind = "OrderSnapshot",
-                        "MockExchange failed to send OrderSnapshot notification to client"
-                    );
-                }
+            if let Some(order) = order
+                && tx.send(order).is_err()
+            {
+                error!(
+                    %exchange,
+                    kind = "OrderSnapshot",
+                    "MockExchange failed to send OrderSnapshot notification to client"
+                );
             }
         });
     }
@@ -1102,6 +1118,8 @@ mod tests {
                 initial_state: snapshot,
                 latency_ms: 0,
                 fees_percent: Decimal::ZERO,
+                feed_latency_ms: None,
+                order_latency_ms: None,
             },
             request_rx,
             mpsc_bounded(1, OverflowPolicy::DropOldest).1,

@@ -164,7 +164,11 @@ pub enum OrderKind {
     Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
 )]
 pub enum TimeInForce {
-    GoodUntilCancelled { post_only: bool },
+    GoodUntilCancelled {
+        post_only: bool,
+    },
+    /// Accepted by the Mock Exchange and treated as Good Until Cancelled.
+    /// Session-end expiry is deferred and not simulated.
     GoodUntilEndOfDay,
     FillOrKill,
     ImmediateOrCancel,

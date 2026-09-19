@@ -1,7 +1,7 @@
 # Spec: Barter fork improvements
 
 - **Fork:** [zhangys2/barter-rs](https://github.com/zhangys2/barter-rs) (upstream: [barter-rs/barter-rs](https://github.com/barter-rs/barter-rs), base `9770b27`)
-- **Status:** Draft
+- **Status:** Implemented (W1-W7 landed on this fork; L3 remains out of scope)
 - **Language:** terms in **bold** are defined in [`CONTEXT.md`](../CONTEXT.md); code anchors are in [`domain-code-map.md`](domain-code-map.md).
 
 ## Problem
@@ -66,7 +66,7 @@ Verified defects and hazards in [`barter-execution/src/exchange/mock/mod.rs`](..
 - R2.1 In a Back-Test, the Mock Exchange receives the same per-Instrument Market Events as the Engine, in timestamp order, before the corresponding Engine event is processed.
 - R2.2 **Market Orders** fill against the opposite side of the Order Book, walking Levels for size. If only Order Book L1 is available, use the best bid/ask; if only Public Trades are available, use the last trade. Unfillable remainder follows Time In Force.
 - R2.3 **Limit Orders** are accepted, reserve Balance (free < total), rest until crossed, and fill fully or partially. Post-only Orders that would cross are rejected.
-- R2.4 Time In Force: Good Until Cancelled, Immediate Or Cancel, Fill Or Kill honoured; Good Until End Of Day may be deferred (documented).
+- R2.4 Time In Force: Good Until Cancelled, Immediate Or Cancel, Fill Or Kill honoured; Good Until End Of Day is accepted by the Mock Exchange and treated as Good Until Cancelled (session-end expiry is deferred).
 - R2.5 **Queue position** is a pluggable model (trait), with at least: `NoQueue` (fill on touch) and a conservative "fill only when traded through" model.
 - R2.6 **Latency** is a pluggable model separating feed latency and order latency (replacing the single `latency_ms` split in half).
 - R2.7 Partial fills emit one Trade per fill and Order snapshots with updated filled quantity.
@@ -77,7 +77,7 @@ Verified defects and hazards in [`barter-execution/src/exchange/mock/mod.rs`](..
 - The `backtests_concurrent` example produces byte-identical Trading Summaries for two runs with identical inputs.
 - Existing examples still run (Market-only Strategies unaffected apart from realistic prices).
 
-**Open question.** Is a mid-level fidelity (L2 + probabilistic queue) enough, or should L3 queue tracking (à la hftbacktest) be in scope? Default: out of scope for this spec.
+**Decision.** L2 plus a pluggable queue model is the fidelity ceiling. Per-order L3 tracking is out of scope.
 
 ## W3 — Test coverage for money logic (P1)
 
@@ -114,7 +114,7 @@ Verified defects and hazards in [`barter-execution/src/exchange/mock/mod.rs`](..
 - R5.2 Account Events are **never** dropped or conflated.
 - R5.3 Criterion benchmarks: parse → normalise → Order Book update → `Engine::process`, per message and per burst.
 - R5.4 Latency instrumentation: exchange time → received time → Engine process time, exportable as percentiles.
-- R5.5 Evaluate integer-tick Order Book levels and faster JSON parsing; adopt only with benchmark evidence.
+- R5.5 Evaluate integer-tick Order Book levels and faster JSON parsing; adopt only with benchmark evidence. Evaluated against the CI Criterion workload (channel + parse/normalise/book + Engine::process); neither change is adopted without a measured >10% win on that workload.
 
 **Acceptance**
 - Under a documented synthetic 10× burst, memory stays bounded and the chosen policy is observable in metrics.
@@ -148,6 +148,6 @@ Verified defects and hazards in [`barter-execution/src/exchange/mock/mod.rs`](..
 
 ## Open questions
 
-1. Which Exchange first for W4: Binance Spot, Bybit, or OKX?
-2. Keep the fork upstream-compatible (small PRs offered to barter-rs) or diverge freely?
-3. Fill-model fidelity ceiling for W2 (see W2 open question).
+1. Which Exchange first for W4? **Binance Spot** (live client in barter-execution/src/client/binance/mod.rs).
+2. Keep the fork upstream-compatible (small PRs offered to barter-rs) or diverge freely? **Keep independently reviewable workstreams** so they can be offered upstream; breaking API changes are listed.
+3. Fill-model fidelity ceiling for W2? **L2 + pluggable queue (NoQueue, ConservativeQueue); L3 out of scope.**

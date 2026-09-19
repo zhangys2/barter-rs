@@ -262,3 +262,6 @@ _Avoid_: Report, stats
 - "Instrument" was used both for an exchange-specific contract and for an exchange-agnostic base/quote/kind — resolved: **Instrument** vs **Market Data Instrument**.
 - "Strategy" meant both the pluggable decision logic and the label on Orders — resolved: **Strategy** vs **Strategy Id**.
 - "Closed" position vs "exited" — resolved: **Position Exited**.
+- Two-state **Health** (Healthy / Reconnecting, default never-connected = Reconnecting) is sufficient; a distinct never-connected state is not modelled unless a concrete consumer requires it.
+- Dense **AssetIndex** / **InstrumentIndex** are the canonical runtime keys; the unused AssetId / InstrumentId types were removed.
+- L3 per-order books remain out of scope; L2 is the simulation fidelity ceiling.

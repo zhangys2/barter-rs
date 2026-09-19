@@ -118,9 +118,11 @@ impl QueueModel for ConservativeQueue {
             barter_instrument::Side::Buy => trade_price <= order_price,
             barter_instrument::Side::Sell => trade_price >= order_price,
         };
-        crossed
-            .then_some(available.min(requested))
-            .unwrap_or_default()
+        if crossed {
+            available.min(requested)
+        } else {
+            Decimal::ZERO
+        }
     }
 }
 
@@ -141,8 +143,9 @@ impl MockOrderBook {
         if let MockMarketEventKind::OrderBook { bids, asks } = kind {
             self.bids = bids;
             self.asks = asks;
-            self.bids.sort_by(|a, b| b.price.cmp(&a.price));
-            self.asks.sort_by(|a, b| a.price.cmp(&b.price));
+            self.bids
+                .sort_by_key(|level| std::cmp::Reverse(level.price));
+            self.asks.sort_by_key(|level| level.price);
         }
     }
 

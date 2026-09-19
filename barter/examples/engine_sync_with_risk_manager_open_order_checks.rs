@@ -215,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DefaultStrategy::default(),
         CustomRiskManager::default(),
         market_stream,
-        DefaultGlobalData::default(),
+        DefaultGlobalData,
         |_| DefaultInstrumentMarketData::default(),
     );
 

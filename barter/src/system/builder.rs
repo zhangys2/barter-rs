@@ -13,7 +13,11 @@ use crate::{
         builder::{ExecutionBuildFutures, ExecutionBuilder},
     },
     shutdown::SyncShutdown,
-    system::{System, SystemAuxillaryHandles, config::ExecutionConfig},
+    system::{
+        System, SystemAuxillaryHandles,
+        config::ExecutionConfig,
+        observation::{MarketLatencyTimes, MarketObservationKey},
+    },
 };
 use barter_data::streams::reconnect::stream::ReconnectingStream;
 use barter_execution::balance::Balance;
@@ -27,7 +31,8 @@ use barter_instrument::{
 use barter_integration::{
     FeedEnded, Terminal,
     channel::{
-        Channel, ChannelTxDroppable, LatencySamples, OverflowPolicy, mpsc_bounded, mpsc_unbounded,
+        Channel, ChannelTxDroppable, MarketLatency, ObservationKey, OverflowPolicy, mpsc_bounded,
+        mpsc_bounded_keyed, mpsc_unbounded,
     },
     collection::snapshot::SnapUpdates,
 };
@@ -39,20 +44,26 @@ use std::{
     fmt::Debug,
     marker::PhantomData,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone)]
 struct TimedMarket<Event> {
     event: Event,
     started: Instant,
+    key: Option<ObservationKey>,
+    exchange_to_received: Option<Duration>,
+}
+
+fn timed_market_key<Event>(item: &TimedMarket<Event>) -> Option<ObservationKey> {
+    item.key
 }
 
 async fn merge_event_feeds<Event, AccountStream>(
     mut market_rx: barter_integration::channel::BoundedRx<TimedMarket<Event>>,
     mut account_stream: AccountStream,
     mut feed_tx: barter_integration::channel::BoundedTx<Event>,
-    market_latency: Arc<Mutex<LatencySamples>>,
+    market_latency: Arc<Mutex<MarketLatency>>,
 ) where
     AccountStream: Stream + Unpin,
     Event: From<AccountStream::Item> + Send,
@@ -76,7 +87,12 @@ async fn merge_event_feeds<Event, AccountStream>(
             market = StreamExt::next(&mut market_rx), if !market_done => {
                 match market {
                     Some(timed) => {
-                        if let Ok(mut samples) = market_latency.lock() { samples.record(timed.started); }
+                        if let Ok(mut samples) = market_latency.lock() {
+                            if let Some(duration) = timed.exchange_to_received {
+                                samples.exchange_to_received.record_duration(duration);
+                            }
+                            samples.received_to_engine.record(timed.started);
+                        }
                         if SinkExt::send(&mut feed_tx, timed.event).await.is_err() { break; }
                     }
                     None => market_done = true,
@@ -332,7 +348,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             execution_build_futures: execution.futures,
             market_channel_capacity,
             market_overflow_policy,
-            market_latency: Arc::new(Mutex::new(LatencySamples::default())),
+            market_latency: Arc::new(Mutex::new(MarketLatency::default())),
             phantom_event: PhantomData,
         })
     }
@@ -362,7 +378,7 @@ pub struct SystemBuild<Engine, Event, MarketStream> {
     pub execution_build_futures: ExecutionBuildFutures,
     pub market_channel_capacity: usize,
     pub market_overflow_policy: OverflowPolicy,
-    pub market_latency: Arc<Mutex<LatencySamples>>,
+    pub market_latency: Arc<Mutex<MarketLatency>>,
 
     phantom_event: PhantomData<Event>,
 }
@@ -377,6 +393,7 @@ where
     Engine::Audit: From<FeedEnded> + Terminal + Debug + Clone + Send + 'static,
     Event: From<MarketStream::Item> + From<AccountStreamEvent> + Debug + Clone + Send + 'static,
     MarketStream: Stream + Send + 'static,
+    MarketStream::Item: MarketObservationKey + MarketLatencyTimes,
 {
     /// Construct a new `SystemBuild` from the provided components.
     pub fn new(
@@ -396,7 +413,7 @@ where
             execution_build_futures,
             market_channel_capacity: 4096,
             market_overflow_policy: OverflowPolicy::DropOldest,
-            market_latency: Arc::new(Mutex::new(LatencySamples::default())),
+            market_latency: Arc::new(Mutex::new(MarketLatency::default())),
             phantom_event: Default::default(),
         }
     }
@@ -447,14 +464,24 @@ where
         // Bound the burst-prone market path while keeping account events lossless on their
         // dedicated unbounded channel. DropOldest is explicit: the next book update can rebuild
         // state, while account/order events must never share this overflow policy.
-        let (market_tx, market_rx) =
-            mpsc_bounded::<TimedMarket<Event>>(market_channel_capacity, market_overflow_policy);
+        // Conflate keeps the latest observation per Instrument per data kind.
+        let (market_tx, market_rx) = if market_overflow_policy == OverflowPolicy::Conflate {
+            mpsc_bounded_keyed::<TimedMarket<Event>>(
+                market_channel_capacity,
+                market_overflow_policy,
+                timed_market_key,
+            )
+        } else {
+            mpsc_bounded::<TimedMarket<Event>>(market_channel_capacity, market_overflow_policy)
+        };
         // Market ingress is bounded and account events are merged separately with priority.
         // The merger applies backpressure to the central bounded feed without allowing market
         // overflow policy to discard account/order events.
         let market_to_engine = runtime.clone().spawn(async move {
             let _ = market_stream
                 .map(|event| TimedMarket {
+                    key: event.market_observation_key(),
+                    exchange_to_received: event.exchange_to_received(),
                     event: Event::from(event),
                     started: Instant::now(),
                 })
@@ -482,9 +509,14 @@ where
                     updates: audit_rx,
                 };
 
+                let process_latency = Arc::clone(&market_latency);
                 let handle = runtime.spawn_blocking(move || {
-                    let shutdown_audit =
-                        sync_run_with_audit(&mut feed_rx, &mut engine, &mut audit_tx);
+                    let shutdown_audit = sync_run_with_audit(
+                        &mut feed_rx,
+                        &mut engine,
+                        &mut audit_tx,
+                        Some(process_latency),
+                    );
 
                     (engine, shutdown_audit)
                 });
@@ -492,8 +524,9 @@ where
                 (handle, Some(audit))
             }
             (EngineFeedMode::Iterator, AuditMode::Disabled) => {
+                let process_latency = Arc::clone(&market_latency);
                 let handle = runtime.spawn_blocking(move || {
-                    let shutdown_audit = sync_run(&mut feed_rx, &mut engine);
+                    let shutdown_audit = sync_run(&mut feed_rx, &mut engine, Some(process_latency));
                     (engine, shutdown_audit)
                 });
 
@@ -509,17 +542,25 @@ where
                     updates: audit_rx,
                 };
 
+                let process_latency = Arc::clone(&market_latency);
                 let handle = runtime.spawn(async move {
-                    let shutdown_audit =
-                        async_run_with_audit(&mut feed_rx, &mut engine, &mut audit_tx).await;
+                    let shutdown_audit = async_run_with_audit(
+                        &mut feed_rx,
+                        &mut engine,
+                        &mut audit_tx,
+                        Some(process_latency),
+                    )
+                    .await;
                     (engine, shutdown_audit)
                 });
 
                 (handle, Some(audit))
             }
             (EngineFeedMode::Stream, AuditMode::Disabled) => {
+                let process_latency = Arc::clone(&market_latency);
                 let handle = runtime.spawn(async move {
-                    let shutdown_audit = async_run(&mut feed_rx, &mut engine).await;
+                    let shutdown_audit =
+                        async_run(&mut feed_rx, &mut engine, Some(process_latency)).await;
                     (engine, shutdown_audit)
                 });
 
@@ -555,12 +596,14 @@ mod tests {
                 .try_send(TimedMarket {
                     event: value,
                     started: Instant::now(),
+                    key: None,
+                    exchange_to_received: None,
                 })
                 .unwrap();
         }
         drop(market_tx);
         let (feed_tx, mut feed_rx) = mpsc_bounded(1, OverflowPolicy::Block);
-        let latency = Arc::new(Mutex::new(LatencySamples::default()));
+        let latency = Arc::new(Mutex::new(MarketLatency::default()));
         let merger = tokio::spawn(merge_event_feeds(
             market_rx,
             stream::iter([999u64]),
