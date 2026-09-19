@@ -40,7 +40,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run cargo test
-        run: cargo test
+        # Do not use --all-targets: that compiles and runs Criterion benches.
+        run: cargo test --workspace --lib --tests
         env:
           # dev-profile debug info overflows DWARF32 linking the large
           # examples under rust-lld on CI runners
@@ -107,9 +108,11 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run explicitly enabled live tests
-        run: cargo test --workspace --all-features -- --ignored
+        run: cargo test --workspace --lib --tests --all-features -- --ignored
         env:
           BARTER_LIVE_TESTS: "1"
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
 
   bench:
     name: criterion regression gate

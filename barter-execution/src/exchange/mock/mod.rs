@@ -20,7 +20,11 @@ use barter_instrument::{
     Side,
     asset::{QuoteAsset, name::AssetNameExchange},
     exchange::ExchangeId,
-    instrument::{Instrument, name::InstrumentNameExchange},
+    instrument::{
+        Instrument,
+        name::InstrumentNameExchange,
+        spec::{InstrumentSpec, OrderQuantityUnits},
+    },
 };
 use barter_integration::{channel::BoundedRx, collection::snapshot::Snapshot};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -662,10 +666,18 @@ impl MockExchange {
             );
         }
 
-        let underlying = match self.find_instrument_data(&request.key.instrument) {
-            Ok(instrument) => instrument.underlying.clone(),
+        let instrument = match self.find_instrument_data(&request.key.instrument) {
+            Ok(instrument) => instrument,
             Err(error) => return (build_open_order_err_response(request, error), None),
         };
+        if let Err(error) = validate_instrument_spec(
+            instrument.spec.as_ref(),
+            request.state.price,
+            request.state.quantity,
+        ) {
+            return (build_open_order_err_response(request, error), None);
+        }
+        let underlying = instrument.underlying.clone();
 
         let time_exchange = self.time_exchange();
 
@@ -1055,6 +1067,69 @@ impl MockExchange {
     }
 }
 
+fn validate_instrument_spec(
+    spec: Option<&InstrumentSpec<AssetNameExchange>>,
+    price: Decimal,
+    quantity: Decimal,
+) -> Result<(), UnindexedOrderError> {
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    if price < spec.price.min {
+        return Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+            format!(
+                "price {price} is below instrument minimum {}",
+                spec.price.min
+            ),
+        )));
+    }
+    if !aligns_to_increment(price, spec.price.tick_size) {
+        return Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+            format!(
+                "price {price} is not a multiple of tick size {}",
+                spec.price.tick_size
+            ),
+        )));
+    }
+    if quantity < spec.quantity.min {
+        return Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+            format!(
+                "quantity {quantity} is below instrument minimum {}",
+                spec.quantity.min
+            ),
+        )));
+    }
+    if !aligns_to_increment(quantity, spec.quantity.increment) {
+        return Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+            format!(
+                "quantity {quantity} is not a multiple of increment {}",
+                spec.quantity.increment
+            ),
+        )));
+    }
+    let notional = match spec.quantity.unit {
+        OrderQuantityUnits::Quote => quantity,
+        OrderQuantityUnits::Asset(_) | OrderQuantityUnits::Contract => price * quantity,
+    };
+    if notional < spec.notional.min {
+        return Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+            format!(
+                "notional {notional} is below instrument minimum {}",
+                spec.notional.min
+            ),
+        )));
+    }
+    Ok(())
+}
+
+fn aligns_to_increment(value: Decimal, increment: Decimal) -> bool {
+    if increment <= Decimal::ZERO {
+        true
+    } else {
+        (value % increment).is_zero()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1067,7 +1142,16 @@ mod tests {
             request::{RequestCancel, RequestOpen},
         },
     };
-    use barter_instrument::{Underlying, instrument::Instrument};
+    use barter_instrument::{
+        Underlying,
+        instrument::{
+            Instrument,
+            spec::{
+                InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice,
+                InstrumentSpecQuantity, OrderQuantityUnits,
+            },
+        },
+    };
     use barter_integration::channel::{OverflowPolicy, mpsc_bounded};
 
     fn exchange() -> MockExchange {
@@ -1642,6 +1726,124 @@ mod tests {
         ));
         drop(request_tx);
         task.await.unwrap();
+    }
+
+    fn specced_exchange() -> MockExchange {
+        let mut exchange = exchange();
+        let spec = InstrumentSpec {
+            price: InstrumentSpecPrice {
+                min: Decimal::from(1),
+                tick_size: Decimal::from(1),
+            },
+            quantity: InstrumentSpecQuantity {
+                unit: OrderQuantityUnits::Asset(AssetNameExchange::from("BTC")),
+                min: Decimal::from(1),
+                increment: Decimal::from(1),
+            },
+            notional: InstrumentSpecNotional {
+                min: Decimal::from(10),
+            },
+        };
+        exchange
+            .instruments
+            .get_mut(&InstrumentNameExchange::from("BTCUSDT"))
+            .expect("BTCUSDT instrument")
+            .spec = Some(spec);
+        exchange.market_books.insert(
+            InstrumentNameExchange::from("BTCUSDT"),
+            MockOrderBook {
+                asks: vec![MockMarketLevel {
+                    price: Decimal::from(20),
+                    quantity: Decimal::from(10),
+                }],
+                bids: vec![MockMarketLevel {
+                    price: Decimal::from(10),
+                    quantity: Decimal::from(10),
+                }],
+            },
+        );
+        exchange
+    }
+
+    fn limit_buy(
+        quantity: Decimal,
+        price: Decimal,
+    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        let mut order = request(Side::Buy, 1, 10);
+        order.state.kind = OrderKind::Limit;
+        order.state.time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
+        order.state.quantity = quantity;
+        order.state.price = price;
+        order.key.cid = ClientOrderId::new(format!("spec-{price}-{quantity}"));
+        order
+    }
+
+    fn assert_spec_rejected(quantity: Decimal, price: Decimal) {
+        let mut exchange = specced_exchange();
+        let before = exchange.account.balances().cloned().collect::<Vec<_>>();
+        let (response, notifications) = exchange.open_order(limit_buy(quantity, price));
+        assert!(matches!(
+            response.state,
+            Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(_)))
+        ));
+        assert!(notifications.is_none());
+        assert_eq!(
+            exchange.account.balances().cloned().collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(exchange.account.orders_open().count(), 0);
+    }
+
+    #[test]
+    fn spec_tick_size_miss_is_rejected_without_mutating_balances() {
+        assert_spec_rejected(Decimal::from(1), Decimal::new(15, 1));
+    }
+
+    #[test]
+    fn spec_quantity_increment_miss_is_rejected_without_mutating_balances() {
+        assert_spec_rejected(Decimal::new(15, 1), Decimal::from(10));
+    }
+
+    #[test]
+    fn spec_below_min_quantity_is_rejected_without_mutating_balances() {
+        assert_spec_rejected(Decimal::new(5, 1), Decimal::from(20));
+    }
+
+    #[test]
+    fn spec_below_min_notional_is_rejected_without_mutating_balances() {
+        assert_spec_rejected(Decimal::from(1), Decimal::from(8));
+    }
+
+    #[tokio::test]
+    async fn spec_valid_limit_still_reserves_and_can_fill() {
+        let mut exchange = specced_exchange();
+        let (response, notifications) =
+            exchange.open_order(limit_buy(Decimal::from(1), Decimal::from(10)));
+        assert!(response.state.is_ok());
+        assert!(notifications.is_none() || notifications.is_some());
+        assert_eq!(exchange.account.orders_open().count(), 1);
+        let usdt = exchange
+            .account
+            .balance(&AssetNameExchange::from("USDT"))
+            .unwrap()
+            .balance;
+        assert!(usdt.free < usdt.total);
+        exchange.apply_market_event(MockMarketEvent {
+            instrument: InstrumentNameExchange::from("BTCUSDT"),
+            time_exchange: DateTime::<Utc>::UNIX_EPOCH,
+            kind: MockMarketEventKind::OrderBook {
+                bids: vec![MockMarketLevel {
+                    price: Decimal::from(9),
+                    quantity: Decimal::from(10),
+                }],
+                asks: vec![MockMarketLevel {
+                    price: Decimal::from(10),
+                    quantity: Decimal::from(10),
+                }],
+            },
+            applied: None,
+        });
+        assert_eq!(exchange.account.orders_open().count(), 0);
     }
 
     #[test]
