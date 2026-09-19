@@ -86,6 +86,10 @@ jobs:
 
       - name: Build examples
         run: cargo build --workspace --examples
+        env:
+          # Same overflow as the test job: rust-lld DWARF32 cannot link
+          # large debug examples on CI runners.
+          CARGO_PROFILE_DEV_DEBUG: "0"
 
   deny:
     name: cargo deny
