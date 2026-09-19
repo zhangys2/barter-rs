@@ -135,7 +135,7 @@ jobs:
           set -euo pipefail
           run_workload() {
             local baseline="$1"
-            cargo bench -p barter-integration --bench channel -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
+            cargo bench -p barter-integration --bench channel --features channel -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
             cargo bench -p barter-data --bench hot_path -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
             cargo bench -p barter --bench engine_process -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
           }
