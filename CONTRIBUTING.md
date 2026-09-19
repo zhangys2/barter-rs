@@ -19,6 +19,8 @@ Do **not** use `cargo test --workspace --all-targets`. That **runs** Criterion b
 
 CI's test job is pinned to `--lib --tests` for the same reason. Compile benches with `--benches --no-run`.
 
+The Criterion 10% gate ignores relative regressions whose absolute delta is under 1µs (`scripts/compare_criterion_baselines.py --min-ns 1000`). Sub-microsecond benches on GitHub runners are noise, not a real regression.
+
 ## Windows MSVC
 
 Leftover test executables lock `target\debug\deps\barter-*.exe` (`LNK1104`). Run tests serially (`--test-threads=1`). If linking fails, kill stale processes:
