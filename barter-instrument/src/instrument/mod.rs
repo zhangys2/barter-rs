@@ -12,7 +12,7 @@ use crate::{
         spec::{InstrumentSpec, InstrumentSpecQuantity, OrderQuantityUnits},
     },
 };
-use derive_more::{Constructor, Display};
+use derive_more::Constructor;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 
@@ -35,14 +35,6 @@ pub mod market_data;
 
 /// Defines the [`InstrumentQuoteAsset`] (underlying base or quote) for an [`Instrument`].
 pub mod quote;
-
-/// Unique identifier for an `Instrument` traded on an execution.
-///
-/// Used to key data events in a memory efficient way.
-#[derive(
-    Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
-)]
-pub struct InstrumentId(pub u64);
 
 #[derive(
     Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,

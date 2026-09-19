@@ -26,6 +26,11 @@
 //!
 //! Both core abstractions provide the robust glue you need to conveniently translate between server & client data models.
 
+#[cfg(test)]
+use criterion as _;
+#[cfg(test)]
+use sha2 as _;
+
 use ::serde::{Deserialize, Serialize};
 
 /// All [`Error`](std::error::Error)s generated in Barter-Integration.

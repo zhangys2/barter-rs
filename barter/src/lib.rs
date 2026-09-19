@@ -49,6 +49,8 @@ use barter_execution::AccountEvent;
 use barter_instrument::{asset::AssetIndex, exchange::ExchangeIndex, instrument::InstrumentIndex};
 use barter_integration::Terminal;
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use criterion as _;
 use derive_more::{Constructor, From};
 use serde::{Deserialize, Serialize};
 use shutdown::Shutdown;

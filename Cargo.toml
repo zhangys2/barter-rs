@@ -71,4 +71,5 @@ rust_decimal_macros = { version = "1.29.1" }
 bytes = { version = "1.5.0" }
 spin_sleep = { version = "1.3.0 "}
 criterion = { version = "0.5.1" }
+proptest = { version = "1.6.0" }
 prost = { version = "0.12.4" }

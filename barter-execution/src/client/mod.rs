@@ -19,6 +19,7 @@ use futures::Stream;
 use std::future::Future;
 
 mod binance;
+pub use binance::{BinanceSpot, BinanceSpotConfig};
 pub mod mock;
 
 pub trait ExecutionClient

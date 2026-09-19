@@ -3,7 +3,7 @@ use barter_data::streams::consumer::MarketStreamEvent;
 use barter_execution::AccountEventKind;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, ops::Add, sync::Arc};
+use std::{fmt::Debug, sync::Arc};
 use tracing::{debug, error, warn};
 
 /// Defines how an [`Engine`](super::Engine) will determine the current time.
@@ -49,7 +49,6 @@ pub struct HistoricalClock {
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 struct HistoricalClockInner {
     time_exchange_last: DateTime<Utc>,
-    time_live_last_event: DateTime<Utc>,
 }
 
 impl HistoricalClock {
@@ -58,7 +57,6 @@ impl HistoricalClock {
         Self {
             inner: Arc::new(parking_lot::RwLock::new(HistoricalClockInner {
                 time_exchange_last: last_exchange_time,
-                time_live_last_event: Utc::now(),
             })),
         }
     }
@@ -66,19 +64,7 @@ impl HistoricalClock {
 
 impl EngineClock for HistoricalClock {
     fn time(&self) -> DateTime<Utc> {
-        let lock = self.inner.read();
-        let time_live_last_event = lock.time_live_last_event;
-        let time_exchange_last = lock.time_exchange_last;
-        drop(lock);
-
-        let delta_since_last_event_live_time =
-            Utc::now().signed_duration_since(time_live_last_event);
-
-        // Edge case: only add TimeDelta if it's positive to handle out of order updates
-        match delta_since_last_event_live_time {
-            delta if delta.num_milliseconds() >= 0 => time_exchange_last.add(delta),
-            _ => time_exchange_last,
-        }
+        self.inner.read().time_exchange_last
     }
 }
 
@@ -106,7 +92,6 @@ where
                 "HistoricalClock updating based on input event time_exchange"
             );
             lock.time_exchange_last = time_event_exchange;
-            lock.time_live_last_event = Utc::now();
             return;
         };
 
@@ -202,7 +187,7 @@ mod tests {
                 .unwrap()
         };
 
-        let cases = vec![
+        let cases = [
             // TC0: Basic case - single event in order
             TestCase {
                 name: "single event in order",
@@ -300,31 +285,12 @@ mod tests {
     }
 
     #[test]
-    fn test_historical_clock_time_delta_calculation() {
+    fn test_historical_clock_time_is_event_time_only() {
         let time_base = DateTime::<Utc>::MIN_UTC;
         let clock = HistoricalClock::new(time_base);
+        assert_eq!(clock.time(), time_base);
 
-        // Get initial time
-        let time_1 = clock.time();
-
-        // Sleep to simulate time passing
         spin_sleep::sleep(std::time::Duration::from_millis(100));
-
-        // Get time after delay
-        let time_2 = clock.time();
-
-        // Verify time has increased
-        assert!(
-            time_2 > time_1,
-            "Historical clock time should increase with wall clock"
-        );
-
-        // Verify increase is reasonable (eg/ close to our sleep duration)
-        let delta_ms = time_2.signed_duration_since(time_1).num_milliseconds();
-
-        assert!(
-            delta_ms >= 95 && delta_ms <= 105,
-            "Historical clock time delta outside expected range"
-        );
+        assert_eq!(clock.time(), time_base);
     }
 }

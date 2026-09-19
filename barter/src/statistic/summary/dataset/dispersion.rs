@@ -199,7 +199,7 @@ mod tests {
 
         let outputs = vec![output_1, output_2, output_3, output_4, output_5];
 
-        for (input, out) in inputs.into_iter().zip(outputs.into_iter()) {
+        for (input, out) in inputs.into_iter().zip(outputs) {
             dispersion.update(
                 input.prev_mean,
                 input.new_mean,

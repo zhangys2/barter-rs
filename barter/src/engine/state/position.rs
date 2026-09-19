@@ -559,7 +559,61 @@ mod tests {
     use super::*;
     use crate::test_utils::{time_plus_days, trade};
     use barter_instrument::instrument::name::InstrumentNameInternal;
+    use proptest::prelude::*;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+
+    proptest! {
+        #[test]
+        fn increasing_position_has_weighted_entry_price(
+            first_quantity in 1u32..100,
+            second_quantity in 1u32..100,
+            first_price in 1u32..10_000,
+            second_price in 1u32..10_000,
+        ) {
+            let time = DateTime::<Utc>::MIN_UTC;
+            let first_quantity = Decimal::from(first_quantity);
+            let second_quantity = Decimal::from(second_quantity);
+            let first_price = Decimal::from(first_price);
+            let second_price = Decimal::from(second_price);
+            let initial = Position::from(&trade(time, Side::Buy, first_price.to_string().parse().unwrap(), first_quantity.to_string().parse().unwrap(), 0.0));
+            let (updated, exited) = initial.update_from_trade(&trade(
+                time_plus_days(time, 1), Side::Buy, second_price.to_string().parse().unwrap(), second_quantity.to_string().parse().unwrap(), 0.0,
+            ));
+            let updated = updated.unwrap();
+            prop_assert!(exited.is_none());
+            prop_assert_eq!(updated.quantity_abs, first_quantity + second_quantity);
+            let expected = (first_price * first_quantity + second_price * second_quantity)
+                / (first_quantity + second_quantity);
+            prop_assert_eq!(updated.price_entry_average, expected);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn reduce_close_and_flip_emit_exit_invariants(
+            open_quantity in 2u32..100,
+            close_quantity in 1u32..100,
+        ) {
+            let time = DateTime::<Utc>::MIN_UTC;
+            let open_quantity = Decimal::from(open_quantity);
+            let close_quantity = Decimal::from(close_quantity);
+            let initial = Position::from(&trade(time, Side::Buy, 100.0, open_quantity.to_string().parse().unwrap(), 0.0));
+            let (updated, exited) = initial.update_from_trade(&trade(
+                time_plus_days(time, 1), Side::Sell, 100.0, close_quantity.to_string().parse().unwrap(), 0.0,
+            ));
+            if close_quantity < open_quantity {
+                prop_assert!(exited.is_none());
+                prop_assert_eq!(updated.unwrap().quantity_abs, open_quantity - close_quantity);
+            } else if close_quantity == open_quantity {
+                prop_assert!(exited.is_some());
+                prop_assert!(updated.is_none());
+            } else {
+                prop_assert!(exited.is_some());
+                prop_assert_eq!(updated.unwrap().quantity_abs, close_quantity - open_quantity);
+            }
+        }
+    }
 
     #[test]
     fn test_position_update_from_trade() {
@@ -1164,10 +1218,10 @@ mod tests {
         for (index, test) in cases.into_iter().enumerate() {
             let actual = calculate_pnl_realised(
                 test.side,
-                test.price_entry_average.into(),
-                test.closed_quantity.into(),
-                test.closed_price.into(),
-                test.closed_fee.into(),
+                test.price_entry_average,
+                test.closed_quantity,
+                test.closed_price,
+                test.closed_fee,
             );
 
             assert_eq!(actual, test.expected, "TC{} failed", index);
@@ -1216,9 +1270,9 @@ mod tests {
 
         for (index, test) in cases.into_iter().enumerate() {
             let actual = calculate_pnl_return(
-                test.pnl_realised.into(),
-                test.price_entry_average.into(),
-                test.quantity_abs_max.into(),
+                test.pnl_realised,
+                test.price_entry_average,
+                test.quantity_abs_max,
             );
 
             assert_eq!(actual, test.expected, "TC{} failed", index);

@@ -60,7 +60,7 @@ mod tests {
         }
 
         // dataset = [0.1, -0.2, -0.05, 0.2, 0.15, -0.17]
-        let inputs = vec![
+        let inputs = [
             // TC0
             Input {
                 prev_mean: dec!(0.0),
@@ -122,7 +122,7 @@ mod tests {
             new_mean: Decimal,
         }
 
-        let inputs = vec![
+        let inputs = [
             // dataset_1 = [10, 100, -10]
             Input {
                 prev_m: dec!(0.0),
@@ -194,7 +194,7 @@ mod tests {
             dec!(16200000000.0),
         ];
 
-        for (index, (input, expected)) in inputs.iter().zip(expected.into_iter()).enumerate() {
+        for (index, (input, expected)) in inputs.iter().zip(expected).enumerate() {
             let actual_m = welford_online::calculate_recurrence_relation_m(
                 input.prev_m,
                 input.prev_mean,
@@ -208,7 +208,7 @@ mod tests {
 
     #[test]
     fn calculate_sample_variance() {
-        let inputs = vec![
+        let inputs = [
             (dec!(0.0), dec!(1)),
             (dec!(1050.0), dec!(5)),
             (dec!(1012.5), dec!(123223)),
@@ -223,7 +223,7 @@ mod tests {
             dec!(4.3045929964271878093926219276),
         ];
 
-        for ((input_m, input_count), expected) in inputs.iter().zip(expected.into_iter()) {
+        for ((input_m, input_count), expected) in inputs.iter().zip(expected) {
             let actual_variance = welford_online::calculate_sample_variance(*input_m, *input_count);
             assert_eq!(actual_variance, expected);
         }
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn calculate_population_variance() {
-        let inputs = vec![
+        let inputs = [
             (dec!(0.0), 1),
             (dec!(1050.0), 5),
             (dec!(1012.5), 123223),
@@ -246,7 +246,7 @@ mod tests {
             dec!(4.3044077091942148760330578512),
         ];
 
-        for (index, (input, expected)) in inputs.iter().zip(expected.into_iter()).enumerate() {
+        for (index, (input, expected)) in inputs.iter().zip(expected).enumerate() {
             let actual_variance =
                 welford_online::calculate_population_variance(input.0, input.1.into());
             assert_eq!(actual_variance, expected, "TC{index} failed");

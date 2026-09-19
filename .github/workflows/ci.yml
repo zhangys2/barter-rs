@@ -9,6 +9,7 @@ on:
     branches: ["main"]
     paths-ignore:
       - "**.md"
+  workflow_dispatch:
 
 jobs:
   check:
@@ -16,74 +17,146 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Run cargo check
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
+        run: cargo check
 
   test:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
+        run: cargo test
         env:
           # dev-profile debug info overflows DWARF32 linking the large
           # examples under rust-lld on CI runners
           CARGO_PROFILE_DEV_DEBUG: "0"
-        with:
-          command: test
 
   lints:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        continue-on-error: false
-        with:
-          command: fmt
-          args: --all -- --check
+        run: cargo fmt --all -- --check
 
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        continue-on-error: false
+        run: cargo clippy -- -D warnings
+
+  docs-and-examples:
+    name: docs and examples
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: Build examples
+        run: cargo build --workspace --examples
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Run cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: clippy
-          args: -- -D warnings
+          command: check
+
+  live-test:
+    name: gated live tests
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run explicitly enabled live tests
+        run: cargo test --workspace --all-features -- --ignored
+        env:
+          BARTER_LIVE_TESTS: "1"
+
+  bench:
+    name: criterion regression gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Benchmark baseline commit
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          set -euo pipefail
+          run_workload() {
+            local baseline="$1"
+            cargo bench -p barter-integration --bench channel -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
+            cargo bench -p barter-data --bench hot_path -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
+            cargo bench -p barter --bench engine_process -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
+          }
+          run_workload head
+          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "No baseline SHA available; recorded HEAD only."
+            exit 0
+          fi
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            echo "Baseline SHA not in history; recorded HEAD only."
+            exit 0
+          fi
+          if ! git show "$BASE_SHA:barter-data/Cargo.toml" 2>/dev/null | grep -q 'name = "hot_path"'; then
+            echo "Baseline commit does not define the Criterion workload; skipping 10% gate."
+            exit 0
+          fi
+          if ! git show "$BASE_SHA:barter/Cargo.toml" 2>/dev/null | grep -q 'name = "engine_process"'; then
+            echo "Baseline commit does not define the Criterion workload; skipping 10% gate."
+            exit 0
+          fi
+          git stash --include-untracked || true
+          git checkout "$BASE_SHA"
+          run_workload main
+          git checkout -
+          git stash pop || true
+          python3 scripts/compare_criterion_baselines.py --baseline main --current head --threshold 0.10

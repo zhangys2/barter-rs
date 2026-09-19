@@ -161,6 +161,9 @@ pub enum Health {
     Healthy,
 
     /// Connection is currently attempting to re-establish after a disconnect or failure.
+    ///
+    /// Also the default for a connection that has never been established. A distinct
+    /// never-connected state is not modelled: consumers treat both cases as not yet Healthy.
     #[default]
     Reconnecting,
 }
@@ -203,5 +206,58 @@ pub fn generate_empty_indexed_connectivity_states(
             .iter()
             .map(|exchange| (exchange.value, ConnectivityState::default()))
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn one_exchange() -> ConnectivityStates {
+        ConnectivityStates {
+            global: Health::Reconnecting,
+            exchanges: [(ExchangeId::Mock, ConnectivityState::default())]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn account_reconnect_and_recovery_update_global_health() {
+        let mut states = one_exchange();
+        states
+            .exchanges
+            .get_mut(&ExchangeId::Mock)
+            .unwrap()
+            .market_data = Health::Healthy;
+        states.exchanges.get_mut(&ExchangeId::Mock).unwrap().account = Health::Healthy;
+        states.global = Health::Healthy;
+        states.update_from_account_reconnecting(&ExchangeId::Mock);
+        assert_eq!(states.global, Health::Reconnecting);
+        assert_eq!(
+            states.connectivity(&ExchangeId::Mock).account,
+            Health::Reconnecting
+        );
+        states.update_from_account_event(&ExchangeIndex(0));
+        assert_eq!(states.global, Health::Healthy);
+    }
+
+    #[test]
+    fn market_reconnect_and_recovery_update_market_health() {
+        let mut states = one_exchange();
+        states
+            .exchanges
+            .get_mut(&ExchangeId::Mock)
+            .unwrap()
+            .market_data = Health::Healthy;
+        states.exchanges.get_mut(&ExchangeId::Mock).unwrap().account = Health::Healthy;
+        states.global = Health::Healthy;
+        states.update_from_market_reconnecting(&ExchangeId::Mock);
+        assert_eq!(
+            states.connectivity(&ExchangeId::Mock).market_data,
+            Health::Reconnecting
+        );
+        states.update_from_market_event(&ExchangeId::Mock);
+        assert_eq!(states.global, Health::Healthy);
     }
 }

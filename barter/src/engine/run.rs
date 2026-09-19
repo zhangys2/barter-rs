@@ -8,11 +8,23 @@ use crate::{
 };
 use barter_integration::{
     FeedEnded, Terminal,
-    channel::{ChannelTxDroppable, Tx},
+    channel::{ChannelTxDroppable, MarketLatency, Tx},
 };
 use futures::{Stream, StreamExt};
-use std::fmt::Debug;
+use std::{
+    fmt::Debug,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tracing::info;
+
+fn record_engine_process(process_latency: &Option<Arc<Mutex<MarketLatency>>>, started: Instant) {
+    if let Some(samples) = process_latency
+        && let Ok(mut samples) = samples.lock()
+    {
+        samples.engine_process.record(started);
+    }
+}
 
 /// Synchronous `Engine` runner that processes input `Events`.
 ///
@@ -22,7 +34,12 @@ use tracing::info;
 /// # Arguments
 /// * `Events` - `Iterator` of events for the `Engine` to process.
 /// * `Engine` - Event processor that produces audit events as output.
-pub fn sync_run<Events, Engine>(feed: &mut Events, engine: &mut Engine) -> Engine::Audit
+/// * `process_latency` - Optional W5.4 Engine process hop samples.
+pub fn sync_run<Events, Engine>(
+    feed: &mut Events,
+    engine: &mut Engine,
+    process_latency: Option<Arc<Mutex<MarketLatency>>>,
+) -> Engine::Audit
 where
     Events: Iterator,
     Events::Item: Debug + Clone,
@@ -42,10 +59,10 @@ where
             break engine.audit(FeedEnded);
         };
 
-        // Process Event with AuditTick generation
+        let started = Instant::now();
         let audit = process_with_audit(engine, event);
+        record_engine_process(&process_latency, started);
 
-        // Check if AuditTick indicates a shutdown is required
         if audit.event.is_terminal() {
             break audit;
         }
@@ -72,10 +89,12 @@ where
 /// * `Events` - `Iterator` of events for the `Engine` to process.
 /// * `Engine` - Event processor that produces audit events as output.
 /// * `AuditTx` - Channel for sending produced audit events.
+/// * `process_latency` - Optional W5.4 Engine process hop samples.
 pub fn sync_run_with_audit<Events, Engine, AuditTx>(
     feed: &mut Events,
     engine: &mut Engine,
     audit_tx: &mut ChannelTxDroppable<AuditTx>,
+    process_latency: Option<Arc<Mutex<MarketLatency>>>,
 ) -> Engine::Audit
 where
     Events: Iterator,
@@ -87,25 +106,22 @@ where
 {
     info!(feed_mode = "sync", audit_mode = "enabled", "Engine running");
 
-    // Run Engine process loop until shutdown
     let shutdown_audit = loop {
         let Some(event) = feed.next() else {
             break engine.audit(FeedEnded);
         };
 
-        // Process Event with AuditTick generation
+        let started = Instant::now();
         let audit = process_with_audit(engine, event);
+        record_engine_process(&process_latency, started);
 
-        // Check if AuditTick indicates shutdown is required
         if audit.event.is_terminal() {
             break audit;
         }
 
-        // Send AuditTick to AuditManager
         audit_tx.send(audit);
     };
 
-    // Send Shutdown audit
     audit_tx.send(shutdown_audit.clone());
 
     info!(
@@ -127,8 +143,12 @@ where
 /// # Arguments
 /// * `Events` - `Stream` of events for the `Engine` to process.
 /// * `Engine` - Event processor that produces audit events as output.
-/// * `AuditTx` - Channel for sending produced audit events.
-pub async fn async_run<Events, Engine>(feed: &mut Events, engine: &mut Engine) -> Engine::Audit
+/// * `process_latency` - Optional W5.4 Engine process hop samples.
+pub async fn async_run<Events, Engine>(
+    feed: &mut Events,
+    engine: &mut Engine,
+    process_latency: Option<Arc<Mutex<MarketLatency>>>,
+) -> Engine::Audit
 where
     Events: Stream + Unpin,
     Events::Item: Debug + Clone,
@@ -142,16 +162,15 @@ where
         "Engine running"
     );
 
-    // Run Engine process loop until shutdown
     let shutdown_audit = loop {
         let Some(event) = feed.next().await else {
             break engine.audit(FeedEnded);
         };
 
-        // Process Event with AuditTick generation
+        let started = Instant::now();
         let audit = process_with_audit(engine, event);
+        record_engine_process(&process_latency, started);
 
-        // Check if AuditTick indicates shutdown is required
         if audit.event.is_terminal() {
             break audit;
         }
@@ -178,10 +197,12 @@ where
 /// * `Events` - `Stream` of events for the `Engine` to process.
 /// * `Engine` - Event processor that produces audit events as output.
 /// * `AuditTx` - Channel for sending produced audit events.
+/// * `process_latency` - Optional W5.4 Engine process hop samples.
 pub async fn async_run_with_audit<Events, Engine, AuditTx>(
     feed: &mut Events,
     engine: &mut Engine,
     audit_tx: &mut ChannelTxDroppable<AuditTx>,
+    process_latency: Option<Arc<Mutex<MarketLatency>>>,
 ) -> Engine::Audit
 where
     Events: Stream + Unpin,
@@ -197,25 +218,22 @@ where
         "Engine running"
     );
 
-    // Run Engine process loop until shutdown
     let shutdown_audit = loop {
         let Some(event) = feed.next().await else {
             break engine.audit(FeedEnded);
         };
 
-        // Process Event with AuditTick generation
+        let started = Instant::now();
         let audit = process_with_audit(engine, event);
+        record_engine_process(&process_latency, started);
 
-        // Check if AuditTick indicates shutdown is required
         if audit.event.is_terminal() {
             break audit;
         }
 
-        // Send AuditTick to AuditManager
         audit_tx.send(audit);
     };
 
-    // Send Shutdown audit
     audit_tx.send(shutdown_audit.clone());
 
     info!(

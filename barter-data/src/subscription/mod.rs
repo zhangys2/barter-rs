@@ -84,7 +84,6 @@ pub enum SubKind {
     PublicTrades,
     OrderBooksL1,
     OrderBooksL2,
-    OrderBooksL3,
     Liquidations,
     Candles,
 }

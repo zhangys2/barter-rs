@@ -1,9 +1,10 @@
 use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
+    error::{ApiError, UnindexedOrderError},
     order::{
         Order,
-        id::ClientOrderId,
+        id::{ClientOrderId, OrderId},
         state::{ActiveOrderState, Cancelled, InactiveOrderState, Open, OrderState},
     },
     trade::Trade,
@@ -11,7 +12,7 @@ use crate::{
 use barter_instrument::{
     asset::{QuoteAsset, name::AssetNameExchange},
     exchange::ExchangeId,
-    instrument::name::InstrumentNameExchange,
+    instrument::{Instrument, name::InstrumentNameExchange},
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
@@ -23,6 +24,7 @@ pub struct AccountState {
     orders_open: FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Open>>,
     orders_cancelled:
         FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Cancelled>>,
+    reservations: FnvHashMap<ClientOrderId, (AssetNameExchange, rust_decimal::Decimal)>,
     trades: Vec<Trade<QuoteAsset, InstrumentNameExchange>>,
 }
 
@@ -62,6 +64,10 @@ impl AccountState {
             .filter(move |trade| trade.time_exchange >= time_since)
     }
 
+    pub fn balance(&self, asset: &AssetNameExchange) -> Option<&AssetBalance<AssetNameExchange>> {
+        self.balances.get(asset)
+    }
+
     pub fn balance_mut(
         &mut self,
         asset: &AssetNameExchange,
@@ -69,8 +75,472 @@ impl AccountState {
         self.balances.get_mut(asset)
     }
 
+    pub fn apply_fill_balances(
+        &mut self,
+        debit_asset: &AssetNameExchange,
+        debit_amount: rust_decimal::Decimal,
+        credit_asset: &AssetNameExchange,
+        credit_amount: rust_decimal::Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedOrderError> {
+        let Some(debit) = self.balances.get(debit_asset) else {
+            return Err(ApiError::AssetInvalid(
+                debit_asset.clone(),
+                "MockExchange has no configured balance for this asset".into(),
+            )
+            .into());
+        };
+        let Some(_) = self.balances.get(credit_asset) else {
+            return Err(ApiError::AssetInvalid(
+                credit_asset.clone(),
+                "MockExchange has no configured balance for this asset".into(),
+            )
+            .into());
+        };
+        if debit_amount < rust_decimal::Decimal::ZERO || credit_amount < rust_decimal::Decimal::ZERO
+        {
+            return Err(
+                ApiError::OrderRejected("balance changes must be non-negative".into()).into(),
+            );
+        }
+        if debit.balance.free < debit_amount {
+            return Err(ApiError::BalanceInsufficient(
+                debit_asset.clone(),
+                format!(
+                    "Available Balance: {}, Required Balance: {}",
+                    debit.balance.free, debit_amount
+                ),
+            )
+            .into());
+        }
+        let debit_balance = self.apply_balance_delta(debit_asset, -debit_amount, time_exchange)?;
+        let credit_balance =
+            self.apply_balance_delta(credit_asset, credit_amount, time_exchange)?;
+        Ok(vec![debit_balance, credit_balance])
+    }
+
+    pub fn reserve_balance(
+        &mut self,
+        cid: &ClientOrderId,
+        asset: &AssetNameExchange,
+        amount: rust_decimal::Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> Result<AssetBalance<AssetNameExchange>, UnindexedOrderError> {
+        let Some(balance) = self.balances.get_mut(asset) else {
+            return Err(ApiError::AssetInvalid(
+                asset.clone(),
+                "MockExchange has no configured balance for this asset".into(),
+            )
+            .into());
+        };
+        if amount < rust_decimal::Decimal::ZERO || balance.balance.free < amount {
+            return Err(ApiError::BalanceInsufficient(
+                asset.clone(),
+                format!(
+                    "Available Balance: {}, Required Balance: {}",
+                    balance.balance.free, amount
+                ),
+            )
+            .into());
+        }
+        balance.balance.free -= amount;
+        balance.time_exchange = time_exchange;
+        self.reservations
+            .insert(cid.clone(), (asset.clone(), amount));
+        Ok(balance.clone())
+    }
+
+    pub fn reservation(
+        &self,
+        cid: &ClientOrderId,
+    ) -> Option<&(AssetNameExchange, rust_decimal::Decimal)> {
+        self.reservations.get(cid)
+    }
+
+    pub fn release_reservation(
+        &mut self,
+        cid: &ClientOrderId,
+        time_exchange: DateTime<Utc>,
+    ) -> Option<AssetBalance<AssetNameExchange>> {
+        let (asset, amount) = self.reservations.remove(cid)?;
+        let balance = self.balances.get_mut(&asset)?;
+        balance.balance.free += amount;
+        balance.time_exchange = time_exchange;
+        Some(balance.clone())
+    }
+
+    pub fn apply_balance_delta(
+        &mut self,
+        asset: &AssetNameExchange,
+        delta: rust_decimal::Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> Result<AssetBalance<AssetNameExchange>, UnindexedOrderError> {
+        let Some(current) = self.balances.get_mut(asset) else {
+            return Err(ApiError::AssetInvalid(
+                asset.clone(),
+                "MockExchange has no configured balance for this asset".into(),
+            )
+            .into());
+        };
+        let new_balance = current.balance.free + delta;
+        if new_balance < rust_decimal::Decimal::ZERO {
+            return Err(ApiError::BalanceInsufficient(
+                asset.clone(),
+                format!(
+                    "Available Balance: {}, Required change: {}",
+                    current.balance.free, -delta
+                ),
+            )
+            .into());
+        }
+        current.balance.free = new_balance;
+        current.balance.total += delta;
+        current.time_exchange = time_exchange;
+        Ok(current.clone())
+    }
+
+    pub fn cancel_order(
+        &mut self,
+        cid: &ClientOrderId,
+        id: Option<&OrderId>,
+        time_exchange: DateTime<Utc>,
+    ) -> Result<Cancelled, UnindexedOrderError> {
+        let order = self.orders_open.get(cid).ok_or_else(|| {
+            ApiError::OrderRejected(format!("order {cid} is unknown or inactive"))
+        })?;
+
+        if id.is_some_and(|id| id != &order.state.id) {
+            return Err(ApiError::OrderRejected(format!("order {cid} id does not match")).into());
+        }
+        if order.state.filled_quantity.abs() >= order.quantity.abs() {
+            return Err(ApiError::OrderAlreadyFullyFilled.into());
+        }
+
+        let Some(order) = self.orders_open.remove(cid) else {
+            return Err(
+                ApiError::OrderRejected(format!("order {cid} is unknown or inactive")).into(),
+            );
+        };
+        let cancelled = Cancelled {
+            id: order.state.id,
+            time_exchange,
+        };
+        self.orders_cancelled.insert(
+            cid.clone(),
+            Order {
+                key: order.key,
+                side: order.side,
+                price: order.price,
+                quantity: order.quantity,
+                kind: order.kind,
+                time_in_force: order.time_in_force,
+                state: cancelled.clone(),
+            },
+        );
+        self.release_reservation(cid, time_exchange);
+        Ok(cancelled)
+    }
+
+    pub fn insert_open_order(&mut self, order: Order<ExchangeId, InstrumentNameExchange, Open>) {
+        self.orders_open.insert(order.key.cid.clone(), order);
+    }
+
+    pub fn remove_filled_order(
+        &mut self,
+        cid: &ClientOrderId,
+    ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
+        self.orders_open.remove(cid)
+    }
+
+    pub fn restore_reservations(
+        &mut self,
+        instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+        fees_percent: rust_decimal::Decimal,
+        time_exchange: DateTime<Utc>,
+    ) {
+        let orders: Vec<_> = self.orders_open.values().cloned().collect();
+        for order in orders {
+            let remaining = order.quantity.abs() - order.state.filled_quantity.abs();
+            if remaining <= rust_decimal::Decimal::ZERO {
+                continue;
+            }
+            let Some(instrument) = instruments.get(&order.key.instrument) else {
+                continue;
+            };
+            let (asset, amount) = match order.side {
+                barter_instrument::Side::Buy => (
+                    instrument.underlying.quote.clone(),
+                    remaining * order.price * (rust_decimal::Decimal::ONE + fees_percent),
+                ),
+                barter_instrument::Side::Sell => (instrument.underlying.base.clone(), remaining),
+            };
+            let already_reserved = self
+                .balance(&asset)
+                .is_some_and(|balance| balance.balance.free < balance.balance.total);
+            if already_reserved {
+                self.reservations
+                    .insert(order.key.cid.clone(), (asset, amount));
+            } else {
+                let _ = self.reserve_balance(&order.key.cid, &asset, amount, time_exchange);
+            }
+        }
+    }
+
+    pub fn open_order_mut(
+        &mut self,
+        cid: &ClientOrderId,
+    ) -> Option<&mut Order<ExchangeId, InstrumentNameExchange, Open>> {
+        self.orders_open.get_mut(cid)
+    }
+
     pub fn ack_trade(&mut self, trade: Trade<QuoteAsset, InstrumentNameExchange>) {
         self.trades.push(trade);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use crate::{
+        balance::Balance,
+        order::{OrderKey, OrderKind, TimeInForce, id::StrategyId},
+    };
+    use barter_instrument::Side;
+    use chrono::TimeZone;
+    use proptest::prelude::*;
+
+    fn account_with_balances() -> AccountState {
+        let mut balances = FnvHashMap::default();
+        for asset in [
+            AssetNameExchange::from("BTC"),
+            AssetNameExchange::from("USDT"),
+        ] {
+            balances.insert(
+                asset.clone(),
+                AssetBalance {
+                    asset: asset.clone(),
+                    balance: Balance {
+                        total: if asset == AssetNameExchange::from("USDT") {
+                            rust_decimal::Decimal::new(10_000, 0)
+                        } else {
+                            rust_decimal::Decimal::new(100, 0)
+                        },
+                        free: if asset == AssetNameExchange::from("USDT") {
+                            rust_decimal::Decimal::new(10_000, 0)
+                        } else {
+                            rust_decimal::Decimal::new(100, 0)
+                        },
+                    },
+                    time_exchange: Utc.timestamp_opt(0, 0).unwrap(),
+                },
+            );
+        }
+        AccountState::new(
+            balances,
+            FnvHashMap::default(),
+            FnvHashMap::default(),
+            FnvHashMap::default(),
+            vec![],
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn fill_conserves_value_at_fill_price(
+            quantity in 1i64..10,
+            price in 1i64..100,
+            buy in any::<bool>(),
+        ) {
+            let mut account = account_with_balances();
+            let base = AssetNameExchange::from("BTC");
+            let quote = AssetNameExchange::from("USDT");
+            let quantity = rust_decimal::Decimal::from(quantity);
+            let price = rust_decimal::Decimal::from(price);
+            let before = account.balance(&quote).unwrap().balance.free
+                + account.balance(&base).unwrap().balance.free * price;
+            if buy {
+                account.apply_fill_balances(&quote, quantity * price, &base, quantity, Utc.timestamp_opt(1, 0).unwrap()).unwrap();
+            } else {
+                account.apply_fill_balances(&base, quantity, &quote, quantity * price, Utc.timestamp_opt(1, 0).unwrap()).unwrap();
+            }
+            let after = account.balance(&quote).unwrap().balance.free
+                + account.balance(&base).unwrap().balance.free * price;
+            prop_assert_eq!(before, after);
+        }
+
+        #[test]
+        fn fill_sequence_conserves_value_at_each_changing_fill_price(
+            fills in proptest::collection::vec((1i64..10, 1i64..100, any::<bool>()), 1..8),
+        ) {
+            let mut account = account_with_balances();
+            let base = AssetNameExchange::from("BTC");
+            let quote = AssetNameExchange::from("USDT");
+
+            for (quantity, price, buy) in fills {
+                let quantity = rust_decimal::Decimal::from(quantity);
+                let price = rust_decimal::Decimal::from(price);
+                let before = account.balance(&quote).unwrap().balance.free
+                    + account.balance(&base).unwrap().balance.free * price;
+                if buy {
+                    account.apply_fill_balances(
+                        &quote,
+                        quantity * price,
+                        &base,
+                        quantity,
+                        Utc.timestamp_opt(1, 0).unwrap(),
+                    ).unwrap();
+                } else {
+                    account.apply_fill_balances(
+                        &base,
+                        quantity,
+                        &quote,
+                        quantity * price,
+                        Utc.timestamp_opt(1, 0).unwrap(),
+                    ).unwrap();
+                }
+                let after = account.balance(&quote).unwrap().balance.free
+                    + account.balance(&base).unwrap().balance.free * price;
+                prop_assert_eq!(before, after);
+            }
+        }
+    }
+
+    #[test]
+    fn apply_balance_delta_updates_total_and_free() {
+        let mut account = account_with_balances();
+        let btc = AssetNameExchange::from("BTC");
+        let updated = account
+            .apply_balance_delta(
+                &btc,
+                rust_decimal::Decimal::new(-2, 0),
+                Utc.timestamp_opt(1, 0).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(updated.balance.total, rust_decimal::Decimal::new(98, 0));
+        assert_eq!(updated.balance.free, rust_decimal::Decimal::new(98, 0));
+    }
+
+    #[test]
+    fn insufficient_balance_reports_the_debited_asset_without_mutating_state() {
+        let mut account = account_with_balances();
+        let base = AssetNameExchange::from("BTC");
+        let quote = AssetNameExchange::from("USDT");
+        let before = account.balances().cloned().collect::<Vec<_>>();
+        let error = account
+            .apply_fill_balances(
+                &base,
+                rust_decimal::Decimal::new(101, 0),
+                &quote,
+                rust_decimal::Decimal::ONE,
+                Utc.timestamp_opt(1, 0).unwrap(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(asset, _)) if asset == base)
+        );
+        assert_eq!(account.balances().cloned().collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn cancel_unknown_and_mismatched_orders_are_typed_errors() {
+        let mut account = account_with_balances();
+        let cid = ClientOrderId::new("missing");
+        let error = account
+            .cancel_order(&cid, None, Utc.timestamp_opt(1, 0).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+    }
+
+    #[test]
+    fn cancel_order_moves_active_order_to_cancelled() {
+        let mut account = account_with_balances();
+        let cid = ClientOrderId::new("client-1");
+        let order_id = OrderId::new("exchange-1");
+        let key = OrderKey {
+            exchange: ExchangeId::Mock,
+            instrument: InstrumentNameExchange::from("BTCUSDT"),
+            strategy: StrategyId::new("strategy-1"),
+            cid: cid.clone(),
+        };
+        account.orders_open.insert(
+            cid.clone(),
+            Order {
+                key,
+                side: Side::Buy,
+                price: rust_decimal::Decimal::new(10, 0),
+                quantity: rust_decimal::Decimal::new(1, 0),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state: Open {
+                    id: order_id.clone(),
+                    time_exchange: Utc.timestamp_opt(0, 0).unwrap(),
+                    filled_quantity: rust_decimal::Decimal::ZERO,
+                },
+            },
+        );
+        let wrong_id = OrderId::new("wrong-id");
+        let mismatch = account
+            .cancel_order(&cid, Some(&wrong_id), Utc.timestamp_opt(1, 0).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+        let cancelled = account
+            .cancel_order(&cid, Some(&order_id), Utc.timestamp_opt(1, 0).unwrap())
+            .unwrap();
+        assert_eq!(cancelled.id, order_id);
+        assert!(!account.orders_open.contains_key(&cid));
+        assert!(account.orders_cancelled.contains_key(&cid));
+
+        let inactive = account
+            .cancel_order(&cid, Some(&order_id), Utc.timestamp_opt(2, 0).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            inactive,
+            UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+    }
+
+    #[test]
+    fn cancel_fully_filled_order_returns_typed_error() {
+        let mut account = account_with_balances();
+        let cid = ClientOrderId::new("filled");
+        let order_id = OrderId::new("exchange-filled");
+        account.orders_open.insert(
+            cid.clone(),
+            Order {
+                key: OrderKey {
+                    exchange: ExchangeId::Mock,
+                    instrument: InstrumentNameExchange::from("BTCUSDT"),
+                    strategy: StrategyId::new("strategy-1"),
+                    cid: cid.clone(),
+                },
+                side: Side::Buy,
+                price: rust_decimal::Decimal::new(10, 0),
+                quantity: rust_decimal::Decimal::new(1, 0),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state: Open {
+                    id: order_id.clone(),
+                    time_exchange: Utc.timestamp_opt(0, 0).unwrap(),
+                    filled_quantity: rust_decimal::Decimal::new(1, 0),
+                },
+            },
+        );
+
+        let error = account
+            .cancel_order(&cid, Some(&order_id), Utc.timestamp_opt(1, 0).unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            UnindexedOrderError::Rejected(ApiError::OrderAlreadyFullyFilled)
+        ));
+        assert!(account.orders_open.contains_key(&cid));
     }
 }
 
@@ -132,6 +602,7 @@ impl From<UnindexedAccountSnapshot> for AccountState {
             balances,
             orders_open,
             orders_cancelled,
+            reservations: FnvHashMap::default(),
             trades: vec![],
         }
     }
