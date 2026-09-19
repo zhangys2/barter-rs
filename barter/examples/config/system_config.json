@@ -9,7 +9,16 @@
         "quote": "usdt"
       },
       "quote": "underlying_quote",
-      "kind": "spot"
+      "kind": "spot",
+      "spec": {
+        "price": { "min": "0.01", "tick_size": "0.01" },
+        "quantity": {
+          "unit": { "Asset": "btc" },
+          "min": "0.00001",
+          "increment": "0.00001"
+        },
+        "notional": { "min": "5" }
+      }
     },
     {
       "exchange": "binance_spot",

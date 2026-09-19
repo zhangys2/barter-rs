@@ -17,7 +17,7 @@ use barter_instrument::{
     exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
-use barter_integration::collection::snapshot::Snapshot;
+use barter_integration::{collection::snapshot::Snapshot, rate_limit::WeightWindow};
 use chrono::{DateTime, Utc};
 use fnv::FnvHashSet;
 #[cfg(test)]
@@ -52,6 +52,12 @@ pub struct BinanceSpotConfig {
     pub recv_window_ms: u64,
     #[serde(default = "default_rate_limit_ms")]
     pub rate_limit_ms: u64,
+    /// Conservative request-weight budget per minute (Binance IP limit is 6_000).
+    #[serde(default = "default_weight_limit_per_minute")]
+    pub weight_limit_per_minute: u32,
+    /// Instruments used by [`ExecutionClient::fetch_trades`] when no prior open/snapshot seeded symbols.
+    #[serde(default)]
+    pub instruments: Vec<InstrumentNameExchange>,
 }
 fn default_api_base_url() -> String {
     "https://api.binance.com".into()
@@ -71,6 +77,9 @@ fn default_recv_window_ms() -> u64 {
 fn default_rate_limit_ms() -> u64 {
     50
 }
+fn default_weight_limit_per_minute() -> u32 {
+    1_200
+}
 
 impl Default for BinanceSpotConfig {
     fn default() -> Self {
@@ -81,6 +90,8 @@ impl Default for BinanceSpotConfig {
             api_secret_env: default_api_secret_env(),
             recv_window_ms: default_recv_window_ms(),
             rate_limit_ms: default_rate_limit_ms(),
+            weight_limit_per_minute: default_weight_limit_per_minute(),
+            instruments: Vec::new(),
         }
     }
 }
@@ -102,6 +113,7 @@ pub struct BinanceSpot {
     config: BinanceSpotConfig,
     http: Client,
     limiter: std::sync::Arc<tokio::sync::Mutex<std::time::Instant>>,
+    weights: std::sync::Arc<tokio::sync::Mutex<WeightWindow>>,
     symbols: std::sync::Arc<tokio::sync::Mutex<FnvHashSet<InstrumentNameExchange>>>,
     credentials_override: Option<(String, String)>,
 }
@@ -119,6 +131,10 @@ impl BinanceSpot {
         }
         Ok((key, secret))
     }
+    async fn track_symbol(&self, instrument: &InstrumentNameExchange) {
+        self.symbols.lock().await.insert(instrument.clone());
+    }
+
     async fn wait_rate_limit(&self) {
         let mut last = self.limiter.lock().await;
         let interval = Duration::from_millis(self.config.rate_limit_ms);
@@ -127,6 +143,39 @@ impl BinanceSpot {
             tokio::time::sleep(wait).await;
         }
         *last = std::time::Instant::now();
+    }
+
+    async fn wait_weight(&self, weight: u32) {
+        let wait = {
+            let mut window = self.weights.lock().await;
+            window.reserve(weight, std::time::Instant::now())
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+            self.weights
+                .lock()
+                .await
+                .start_new_window(weight, std::time::Instant::now());
+        }
+        self.wait_rate_limit().await;
+    }
+
+    fn observe_used_weight(&self, headers: &reqwest::header::HeaderMap) {
+        let Some(value) = headers
+            .get("x-mbx-used-weight-1m")
+            .or_else(|| headers.get("X-MBX-USED-WEIGHT-1M"))
+        else {
+            return;
+        };
+        let Ok(text) = value.to_str() else {
+            return;
+        };
+        let Ok(used) = text.parse::<u32>() else {
+            return;
+        };
+        if let Ok(mut window) = self.weights.try_lock() {
+            window.observe_used(used, std::time::Instant::now());
+        }
     }
 
     async fn signed_get(
@@ -192,7 +241,7 @@ impl BinanceSpot {
         method: reqwest::Method,
         params: Vec<(&str, String)>,
     ) -> Result<Value, UnindexedClientError> {
-        self.wait_rate_limit().await;
+        self.wait_weight(1).await;
         let (api_key, _) = self.credentials()?;
         let response = self
             .http
@@ -205,6 +254,7 @@ impl BinanceSpot {
             .send()
             .await
             .map_err(connectivity_error)?;
+        self.observe_used_weight(response.headers());
         let status = response.status();
         let value: Value = response
             .json()
@@ -246,7 +296,7 @@ impl BinanceSpot {
         path: &str,
         mut params: Vec<(&str, String)>,
     ) -> Result<Value, UnindexedClientError> {
-        self.wait_rate_limit().await;
+        self.wait_weight(request_weight(&method, path)).await;
         let (api_key, secret) = self.credentials()?;
         params.push(("recvWindow", self.config.recv_window_ms.to_string()));
         params.push(("timestamp", now_millis().to_string()));
@@ -272,6 +322,7 @@ impl BinanceSpot {
             .send()
             .await
             .map_err(connectivity_error)?;
+        self.observe_used_weight(response.headers());
         let status = response.status();
         let body = response.text().await.map_err(connectivity_error)?;
         let value: Value = serde_json::from_str(&body)
@@ -318,13 +369,16 @@ impl BinanceSpot {
 
 #[cfg(test)]
 fn test_client(config: BinanceSpotConfig) -> BinanceSpot {
+    let symbols = config.instruments.iter().cloned().collect();
+    let weights = WeightWindow::new(config.weight_limit_per_minute, Duration::from_secs(60));
     BinanceSpot {
         config,
         http: Client::new(),
         limiter: std::sync::Arc::new(tokio::sync::Mutex::new(
             std::time::Instant::now() - Duration::from_secs(1),
         )),
-        symbols: std::sync::Arc::new(tokio::sync::Mutex::new(FnvHashSet::default())),
+        weights: std::sync::Arc::new(tokio::sync::Mutex::new(weights)),
+        symbols: std::sync::Arc::new(tokio::sync::Mutex::new(symbols)),
         credentials_override: Some(("test-key".into(), "test-secret".into())),
     }
 }
@@ -334,13 +388,18 @@ impl ExecutionClient for BinanceSpot {
     type Config = BinanceSpotConfig;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
     fn new(config: Self::Config) -> Self {
+        let symbols = config.instruments.iter().cloned().collect();
         Self {
-            config,
+            config: config.clone(),
             http: Client::new(),
             limiter: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::time::Instant::now() - Duration::from_secs(1),
             )),
-            symbols: std::sync::Arc::new(tokio::sync::Mutex::new(FnvHashSet::default())),
+            weights: std::sync::Arc::new(tokio::sync::Mutex::new(WeightWindow::new(
+                config.weight_limit_per_minute,
+                Duration::from_secs(60),
+            ))),
+            symbols: std::sync::Arc::new(tokio::sync::Mutex::new(symbols)),
             credentials_override: None,
         }
     }
@@ -372,6 +431,9 @@ impl ExecutionClient for BinanceSpot {
                 })
             })
             .collect();
+        for instrument in instruments {
+            self.track_symbol(instrument).await;
+        }
         let mut snapshots = Vec::new();
         for instrument in instruments {
             let orders = self
@@ -396,6 +458,9 @@ impl ExecutionClient for BinanceSpot {
         let client = self.clone();
         let assets = assets.to_vec();
         let instruments = instruments.to_vec();
+        for instrument in &instruments {
+            client.track_symbol(instrument).await;
+        }
         type BinanceWebSocket = tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >;
@@ -581,6 +646,7 @@ impl ExecutionClient for BinanceSpot {
             strategy: request.key.strategy.clone(),
             cid: request.key.cid.clone(),
         };
+        self.track_symbol(request.key.instrument).await;
         let mut params = vec![
             ("symbol", request.key.instrument.to_string()),
             (
@@ -828,6 +894,17 @@ fn parse_user_data_order(value: &Value) -> Option<UnindexedAccountEvent> {
     })
 }
 
+fn request_weight(method: &reqwest::Method, path: &str) -> u32 {
+    match (method, path) {
+        (&reqwest::Method::GET, "/api/v3/account") => 20,
+        (&reqwest::Method::GET, "/api/v3/myTrades") => 20,
+        (&reqwest::Method::GET, "/api/v3/openOrders") => 6,
+        (&reqwest::Method::POST, "/api/v3/order") => 1,
+        (&reqwest::Method::DELETE, "/api/v3/order") => 1,
+        _ => 1,
+    }
+}
+
 fn api_order_error(message: impl Into<String>) -> UnindexedOrderError {
     UnindexedOrderError::Rejected(ApiError::OrderRejected(message.into()))
 }
@@ -839,6 +916,18 @@ fn connectivity_error(error: reqwest::Error) -> UnindexedClientError {
 mod tests {
     use super::*;
 
+    fn live_tests_enabled() -> bool {
+        std::env::var("BARTER_LIVE_TESTS").as_deref() == Ok("1")
+            && std::env::var("BINANCE_API_KEY")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .is_some()
+            && std::env::var("BINANCE_API_SECRET")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .is_some()
+    }
+
     #[test]
     fn config_defaults_reference_environment_only() {
         let config: BinanceSpotConfig = serde_json::from_str("{}").unwrap();
@@ -848,6 +937,8 @@ mod tests {
         assert_eq!(config.api_secret_env, "BINANCE_API_SECRET");
         assert_eq!(config.recv_window_ms, 5_000);
         assert_eq!(config.rate_limit_ms, 50);
+        assert_eq!(config.weight_limit_per_minute, 1_200);
+        assert!(config.instruments.is_empty());
     }
 
     #[tokio::test]
@@ -930,6 +1021,8 @@ mod tests {
             api_secret_env: "BARTER_TEST_BINANCE_SECRET".into(),
             recv_window_ms: 5_000,
             rate_limit_ms: 0,
+            weight_limit_per_minute: 6_000,
+            instruments: vec![InstrumentNameExchange::from("BTCUSDT")],
         };
         let client = test_client(config);
         let trades = client
@@ -980,14 +1073,165 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires BINANCE_API_KEY/BINANCE_API_SECRET and explicit BARTER_LIVE_TESTS=1"]
     async fn gated_testnet_account_snapshot() {
-        if std::env::var("BARTER_LIVE_TESTS").as_deref() != Ok("1")
-            || std::env::var("BINANCE_API_KEY").is_err()
-            || std::env::var("BINANCE_API_SECRET").is_err()
-        {
+        if !live_tests_enabled() {
             return;
         }
         let client = BinanceSpot::new(BinanceSpotConfig::testnet());
         client.account_snapshot(&[], &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_trades_uses_configured_instruments_without_side_api() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let size = tokio::io::AsyncReadExt::read(&mut socket, &mut request)
+                .await
+                .unwrap();
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(request.contains("/api/v3/myTrades?"));
+            assert!(request.contains("symbol=BTCUSDT"));
+            let body = r#"[{"id":8,"orderId":7,"price":"100","qty":"1","commission":"0.1","time":1,"isBuyer":true}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nx-mbx-used-weight-1m: 20\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .unwrap();
+        });
+        let config = BinanceSpotConfig {
+            api_base_url: format!("http://{address}"),
+            rate_limit_ms: 0,
+            weight_limit_per_minute: 6_000,
+            instruments: vec![InstrumentNameExchange::from("BTCUSDT")],
+            ..Default::default()
+        };
+        let client = test_client(config);
+        let trades = ExecutionClient::fetch_trades(&client, DateTime::<Utc>::UNIX_EPOCH)
+            .await
+            .unwrap();
+        assert_eq!(trades.len(), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn weight_window_spaces_a_burst_so_the_server_does_not_429() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut last: Option<std::time::Instant> = None;
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let now = std::time::Instant::now();
+                if let Some(previous) = last {
+                    assert!(
+                        now.duration_since(previous) >= std::time::Duration::from_millis(20),
+                        "burst was not spaced by the weight window"
+                    );
+                }
+                last = Some(now);
+                let mut request = vec![0; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request)
+                    .await
+                    .unwrap();
+                let body = r#"{"balances":[]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nx-mbx-used-weight-1m: 20\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+            let _ = tx.send(());
+        });
+        let config = BinanceSpotConfig {
+            api_base_url: format!("http://{address}"),
+            rate_limit_ms: 0,
+            weight_limit_per_minute: 20,
+            ..Default::default()
+        };
+        let client = test_client(config);
+        // Shrink the window so the test is fast: replace the client's window.
+        *client.weights.lock().await = WeightWindow::new(20, Duration::from_millis(40));
+        client.account_snapshot(&[], &[]).await.unwrap();
+        client.account_snapshot(&[], &[]).await.unwrap();
+        rx.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BINANCE_API_KEY/BINANCE_API_SECRET and explicit BARTER_LIVE_TESTS=1"]
+    async fn gated_testnet_open_cancel_reconcile() {
+        if !live_tests_enabled() {
+            return;
+        }
+        let mut config = BinanceSpotConfig::testnet();
+        let instrument = InstrumentNameExchange::from("BTCUSDT");
+        config.instruments = vec![instrument.clone()];
+        let client = BinanceSpot::new(config);
+        let snapshot = client
+            .account_snapshot(&[], std::slice::from_ref(&instrument))
+            .await
+            .unwrap();
+        let cid = crate::order::id::ClientOrderId::random();
+        let open = client
+            .open_order(OrderEvent {
+                key: OrderKey {
+                    exchange: ExchangeId::BinanceSpot,
+                    instrument: &instrument,
+                    strategy: crate::order::id::StrategyId::new("live-round-trip"),
+                    cid: cid.clone(),
+                },
+                state: crate::order::request::RequestOpen {
+                    side: Side::Buy,
+                    price: rust_decimal::Decimal::from(1000),
+                    quantity: rust_decimal::Decimal::new(1, 5),
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
+                },
+            })
+            .await
+            .expect("open response");
+        let opened = open.state.expect("testnet accepted far limit");
+        let opens = client
+            .fetch_open_orders(std::slice::from_ref(&instrument))
+            .await
+            .unwrap();
+        assert!(
+            opens.iter().any(|order| order.key.cid == cid),
+            "venue open orders must include the Engine-bound cid"
+        );
+        let cancelled = client
+            .cancel_order(OrderEvent {
+                key: OrderKey {
+                    exchange: ExchangeId::BinanceSpot,
+                    instrument: &instrument,
+                    strategy: crate::order::id::StrategyId::new("live-round-trip"),
+                    cid: cid.clone(),
+                },
+                state: crate::order::request::RequestCancel {
+                    id: Some(opened.id.clone()),
+                },
+            })
+            .await
+            .expect("cancel response");
+        assert!(cancelled.state.is_ok());
+        let opens = client
+            .fetch_open_orders(&[InstrumentNameExchange::from("BTCUSDT")])
+            .await
+            .unwrap();
+        assert!(opens.iter().all(|order| order.key.cid != cid));
+        let trades = ExecutionClient::fetch_trades(&client, DateTime::<Utc>::UNIX_EPOCH)
+            .await
+            .unwrap();
+        let _ = (snapshot, trades);
     }
 
     #[test]

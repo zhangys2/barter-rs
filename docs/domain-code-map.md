@@ -17,7 +17,7 @@ Tests are mostly inline `mod tests` in the file named under *Ownership*; "inline
 | **Underlying**, **Base Asset** | [`instrument/src/lib.rs`](../barter-instrument/src/lib.rs) — `Underlying` | `BaseAsset` marker in [`asset/mod.rs`](../barter-instrument/src/asset/mod.rs) | `InstrumentFilter::Underlyings` | Unknown |
 | **Quote Asset** | [`instrument/src/instrument/quote.rs`](../barter-instrument/src/instrument/quote.rs) — `InstrumentQuoteAsset` | `QuoteAsset` marker in [`asset/mod.rs`](../barter-instrument/src/asset/mod.rs) | fee/PnL types keyed `QuoteAsset` (`Trade`, `Position`) | Unknown |
 | **Instrument Kind** | [`instrument/src/instrument/kind/mod.rs`](../barter-instrument/src/instrument/kind/mod.rs) — `InstrumentKind` | `kind/{perpetual,future,option}.rs` | `MarketDataInstrumentKind` (data-side twin) | Unknown |
-| **Instrument Spec** | [`instrument/src/instrument/spec.rs`](../barter-instrument/src/instrument/spec.rs) — `InstrumentSpec` | same | `Instrument::spec` (optional) | Unknown |
+| **Instrument Spec** | [`instrument/src/instrument/spec.rs`](../barter-instrument/src/instrument/spec.rs) — `InstrumentSpec` | Mock Exchange enforces tick/qty/notional in [`execution/src/exchange/mock/mod.rs`](../barter-execution/src/exchange/mock/mod.rs) `open_order` | `Instrument::spec` (optional); `InstrumentConfig.spec` | mock unit tests `spec_tick_size_miss_is_rejected_without_mutating_balances`, `spec_quantity_increment_miss_is_rejected_without_mutating_balances`, `spec_below_min_quantity_is_rejected_without_mutating_balances`, `spec_below_min_notional_is_rejected_without_mutating_balances`, `spec_valid_limit_still_reserves_and_can_fill` |
 | **Internal Name** | [`instrument/src/instrument/name.rs`](../barter-instrument/src/instrument/name.rs) — `InstrumentNameInternal`; [`asset/name.rs`](../barter-instrument/src/asset/name.rs) — `AssetNameInternal` | same | `TradingSummary` keys | Unknown |
 | **Exchange Name** | same files — `InstrumentNameExchange`, `AssetNameExchange` | same | `ExecutionClient` methods; `Unindexed*` type aliases in `execution` | Unknown |
 | **Indexed Instruments** | [`instrument/src/index/mod.rs`](../barter-instrument/src/index/mod.rs) — `IndexedInstruments::new` | [`index/builder.rs`](../barter-instrument/src/index/builder.rs) — `IndexedInstrumentsBuilder` | `EngineState::builder`, `ExecutionBuilder`, `init_indexed_multi_exchange_market_stream` | inline (`index/mod.rs`, `index/builder.rs`) |
@@ -54,7 +54,7 @@ Tests are mostly inline `mod tests` in the file named under *Ownership*; "inline
 
 > **Status:** `MockExecution` and the Binance Spot `ExecutionClient` are implemented in `barter-execution`; Binance account updates use a user-data websocket with REST snapshot reconciliation on frames/reconnect; testnet integration remains explicitly gated.
 >
-> Remaining `Unknown` rows (Underlying/Base Asset, Quote Asset, Instrument Kind, Instrument Spec, Internal Name, Exchange Name) are type/identity plumbing outside W3.R3.1–R3.5 and stay explicitly out of scope.
+> Remaining `Unknown` rows (Underlying/Base Asset, Quote Asset, Instrument Kind, Internal Name, Exchange Name) are type/identity plumbing outside W3.R3.1–R3.5 and stay explicitly out of scope. Instrument Spec is enforced by the Mock Exchange.
 
 ## Engine and state
 

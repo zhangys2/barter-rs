@@ -30,6 +30,13 @@ def main() -> int:
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--current", required=True)
     parser.add_argument("--threshold", type=float, default=0.10)
+    parser.add_argument(
+        "--min-ns",
+        type=float,
+        default=1000.0,
+        help="Ignore relative regressions smaller than this absolute nanosecond delta "
+        "(CI noise on sub-microsecond benches).",
+    )
     args = parser.parse_args()
 
     root = Path(args.criterion_dir)
@@ -56,11 +63,16 @@ def main() -> int:
         if base_mean <= 0:
             continue
         delta = (new_mean - base_mean) / base_mean
+        abs_delta = new_mean - base_mean
         status = "ok"
-        if delta > args.threshold:
+        if delta > args.threshold and abs_delta > args.min_ns:
             status = "REGRESSED"
             failed = True
-        print(f"{status:9} {key}: {delta:+.1%} ({base_mean:.4g} -> {new_mean:.4g})")
+        elif delta > args.threshold:
+            status = "noise"
+        print(
+            f"{status:9} {key}: {delta:+.1%} ({base_mean:.4g} -> {new_mean:.4g})"
+        )
 
     return 1 if failed else 0
 

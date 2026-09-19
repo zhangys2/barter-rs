@@ -40,7 +40,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run cargo test
-        run: cargo test
+        # Do not use --all-targets: that compiles and runs Criterion benches.
+        run: cargo test --workspace --lib --tests
         env:
           # dev-profile debug info overflows DWARF32 linking the large
           # examples under rust-lld on CI runners
@@ -85,6 +86,10 @@ jobs:
 
       - name: Build examples
         run: cargo build --workspace --examples
+        env:
+          # Same overflow as the test job: rust-lld DWARF32 cannot link
+          # large debug examples on CI runners.
+          CARGO_PROFILE_DEV_DEBUG: "0"
 
   deny:
     name: cargo deny
@@ -107,9 +112,11 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run explicitly enabled live tests
-        run: cargo test --workspace --all-features -- --ignored
+        run: cargo test --workspace --lib --tests --all-features -- --ignored
         env:
           BARTER_LIVE_TESTS: "1"
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
 
   bench:
     name: criterion regression gate
@@ -132,7 +139,7 @@ jobs:
           set -euo pipefail
           run_workload() {
             local baseline="$1"
-            cargo bench -p barter-integration --bench channel -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
+            cargo bench -p barter-integration --bench channel --features channel -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
             cargo bench -p barter-data --bench hot_path -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
             cargo bench -p barter --bench engine_process -- --save-baseline "$baseline" --warm-up-time 0.3 --measurement-time 1 --sample-size 10
           }
